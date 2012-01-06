@@ -1,0 +1,37 @@
+xserver-xorg-input-gesture (0.1.0-4) unstable; urgency=low
+
+  * Exception handling routine added. This commit is to fix Xorg BS problem at booting time.
+  * Git: 165.213.180.234:slp/pkgs/xorg/driver/xserver-xorg-input-gesture
+  * Tag: xserver-xorg-input-gesture_0.1.0-4
+
+ -- Sung-Jin Park <sj76.park@samsung.com>  Mon, 28 Nov 2011 15:20:14 +0900
+
+xserver-xorg-input-gesture (0.1.0-3) unstable; urgency=low
+
+  * Define ErrorStatus and check up error status at important check points
+    Fix GestureEventsFlush() not to modify timestamp of each event
+    Remove unnecessary modification and remove unused code
+    Remove unused macro from gesture.h
+    Remove whitespace and fix indentation
+    Replace GestureEventsFree() with GestureEventsDrop()
+  * Git: 165.213.180.234:slp/pkgs/xorg/driver/xserver-xorg-input-gesture
+  * Tag: xserver-xorg-input-gesture_0.1.0-3
+
+ -- Sung-Jin Park <sj76.park@samsung.com>  Mon, 21 Nov 2011 22:51:22 +0900
+
+xserver-xorg-input-gesture (0.1.0-2) unstable; urgency=low
+
+  * add null check
+  * Git: 165.213.180.234:slp/pkgs/xorg/driver/xserver-xorg-input-gesture
+  * Tag: xserver-xorg-input-gesture_0.1.0-2
+
+ -- SooChan Lim <sc1.lim@samsung.com>  Tue, 08 Nov 2011 12:44:49 +0900
+
+xserver-xorg-input-gesture (0.1.0-1) unstable; urgency=low
+
+  * Initial version
+  * Git: 165.213.180.234:slp/pkgs/xorg/driver/xserver-xorg-input-gesture
+  * Tag: xserver-xorg-input-gesture_0.1.0-1
+
+ -- Sung-Jin Park <sj76.park@samsung.com>  Wed, 19 Oct 2011 17:13:15 +0900
+
