@@ -1,6 +1,6 @@
 Name:       xorg-x11-drv-input-gesture
 Summary:    X.Org X server -- Xserver gesture driver
-Version:    0.1.0
+Version:	0.1.0
 Release:    4
 Group:      System/X Hardware Support
 License:    MIT
