@@ -22,10 +22,10 @@
 # Process this file with autoconf to produce a configure script
 
 AC_PREREQ(2.57)
-AC_INIT([xf86-input-gesture],
-        0.0.1,
+AC_INIT([xserver-xorg-input-gesture],
+        0.1.0,
         [https://bugs.freedesktop.org/enter_bug.cgi?product=xorg],
-        xf86-input-gesture)
+        xserver-xorg-input-gesture)
 
 AC_CONFIG_SRCDIR([Makefile.am])
 AC_CONFIG_AUX_DIR(.)

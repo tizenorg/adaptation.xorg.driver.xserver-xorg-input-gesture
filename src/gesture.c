@@ -58,10 +58,6 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #endif
 
-#define __DEBUG__
-//#define __DETAIL_DEBUG__
-//#define __DEBUG_EVENT_HANDLER__
-
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -115,9 +111,10 @@ void GestureHandleMotionEvent(int screen_num, InternalEvent *ev, DeviceIntPtr de
 static Bool PointInBorderSize(WindowPtr pWin, int x, int y);
 static WindowPtr GestureWindowOnXY(int x, int y);
 Bool GestureHasFingerEventMask(int eventType, int num_finger);
+static double get_angle(int x1, int y1, int x2, int y2);
 
 //Gesture recognizer and handlers
-void GestureRecognize_GroupPinchRotation(int type, InternalEvent *ev, DeviceIntPtr device, int idx);
+void GestureRecognize_GroupPinchRotation(int type, InternalEvent *ev, DeviceIntPtr device, int idx, int timer_expired);
 void GestureRecognize_GroupFlick(int type, InternalEvent *ev, DeviceIntPtr device, int idx);
 void GestureRecognize_GroupPan(int type, InternalEvent *ev, DeviceIntPtr device, int idx, int timer_expired);
 void GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int idx, int timer_expired);
@@ -125,7 +122,7 @@ void GestureRecognize_GroupTapNHold(int type, InternalEvent *ev, DeviceIntPtr de
 void GestureRecognize_GroupHold(int type, InternalEvent *ev, DeviceIntPtr device, int idx, int timer_expired);
 void GestureHandleGesture_Flick(int num_of_fingers, int distance, Time duration, int direction);
 void GestureHandleGesture_Tap(int num_finger, int tap_repeat, int cx, int cy);
-void GestureHandleGesture_PinchRotation(int num_of_fingers, double zoom, double angle, int distance, int cx, int cy);
+void GestureHandleGesture_PinchRotation(int num_of_fingers, double zoom, double angle, int distance, int cx, int cy, int kinds);
 void GestureHandleGesture_Hold(int num_fingers, int cx, int cy, Time holdtime, int kinds);
 void GestureHandleGesture_TapNHold(int num_fingers, int cx, int cy, Time interval, Time holdtime, int kinds);
 void GestureHandleGesture_Pan(int num_fingers, short int dx, short int dy, int direction, int distance, Time duration, int kinds);
@@ -267,6 +264,63 @@ GestureHasFingerEventMask(int eventType, int num_finger)
 	return ret;
 }
 
+static double
+get_angle(int x1, int y1, int x2, int y2)
+{
+   double a, xx, yy;
+   xx = fabs(x2 - x1);
+   yy = fabs(y2 - y1);
+
+   if (((int) xx) && ((int) yy))
+     {
+        a = atan(yy / xx);
+        if (x1 < x2)
+          {
+             if (y1 < y2)
+               {
+                  return (RAD_360DEG - a);
+               }
+             else
+               {
+                  return (a);
+               }
+          }
+        else
+          {
+             if (y1 < y2)
+               {
+                  return (RAD_180DEG + a);
+               }
+             else
+               {
+                  return (RAD_180DEG - a);
+               }
+          }
+     }
+
+   if (((int) xx))
+     {  /* Horizontal line */
+        if (x2 < x1)
+          {
+             return (RAD_180DEG);
+          }
+        else
+          {
+             return (0.0);
+          }
+     }
+
+   /* Vertical line */
+   if (y2 < y1)
+     {
+        return (RAD_90DEG);
+     }
+   else
+     {
+        return (RAD_270DEG);
+     }
+}
+
 void
 GestureHandleGesture_Flick(int num_of_fingers, int distance, Time duration, int direction)
 {
@@ -352,21 +406,21 @@ GestureHandleGesture_Tap(int num_finger, int tap_repeat, int cx, int cy)
 	GestureSendEvent(target_pWin, GestureNotifyTap, GestureTapMask, (xGestureCommonEvent *)&tev);
 }
 
-void GestureHandleGesture_PinchRotation(int num_of_fingers, double zoom, double angle, int distance, int cx, int cy)
+void GestureHandleGesture_PinchRotation(int num_of_fingers, double zoom, double angle, int distance, int cx, int cy, int kinds)
 {
 	Window target_win;
 	WindowPtr target_pWin;
 	xGestureNotifyPinchRotationEvent prev;
 
 #ifdef __DETAIL_DEBUG__
-	ErrorF("[X11][GestureHandleGesture_PinchRotation] num_fingers=%d, zoom=%.2f, angle=%.2f, distance=%d\n",
-				num_of_fingers, zoom, angle, distance, cx, cy);
+	ErrorF("[X11][GestureHandleGesture_PinchRotation] num_fingers=%d, zoom=%.2f, angle=%.2f(deg=%.2f), distance=%d, cx=%d, cy=%d\n",
+				num_of_fingers, zoom, angle, rad2degree(angle), distance, cx, cy);
 #endif//__DETAIL_DEBUG__
 
 	g_pGesture->recognized_gesture |= PinchRotationFilterMask;
 	memset(&prev, 0, sizeof(xGestureNotifyPinchRotationEvent));
 	prev.type = GestureNotifyPinchRotation;
-	prev.kind = GestureDone;
+	prev.kind = kinds;
 	prev.num_finger = num_of_fingers;
 	prev.zoom = XDoubleToFixed(zoom);
 	prev.angle = XDoubleToFixed(angle);
@@ -387,7 +441,7 @@ void GestureHandleGesture_PinchRotation(int num_of_fingers, double zoom, double 
 	}
 
 #ifdef __DETAIL_DEBUG__
-	ErrorF("[X11][GestureHandleGesture_PinchRotation] prev.window=0x%x, g_pGesture->grabMask=0x%x\n", prev.window, g_pGesture->grabMask);
+	ErrorF("[X11][GestureHandleGesture_PinchRotation] prev.window=0x%x, g_pGesture->grabMask=0x%x\n", (unsigned int)prev.window, (unsigned int)g_pGesture->grabMask);
 #endif//__DETAIL_DEBUG__
 
 	GestureSendEvent(target_pWin, GestureNotifyPinchRotation, GesturePinchRotationMask, (xGestureCommonEvent *)&prev);
@@ -514,11 +568,266 @@ void GestureHandleGesture_Pan(int num_fingers, short int dx, short int dy, int d
 }
 
 void
-GestureRecognize_GroupPinchRotation(int type, InternalEvent *ev, DeviceIntPtr device, int idx)
+GestureRecognize_GroupPinchRotation(int type, InternalEvent *ev, DeviceIntPtr device, int idx, int timer_expired)
 {
+	static int cx, cy;
 
-	g_pGesture->recognized_gesture &= ~PinchRotationFilterMask;
+	static int num_pressed = 0;
+	static int state = GestureEnd;
+	static int event_type = GestureNotifyPinchRotation;
+	static OsTimerPtr pinchrotation_event_timer = NULL;
+
+	static pixman_region16_t base_area;
+	static pixman_region16_t cur_area;
+
+	static double base_distance = 0.0f;
+	static double base_angle = 0.0f;
+
+	static double prev_distance = 0.0f;
+	static double prev_angle = 0.0f;
+
+	static double cur_distance = 0.0f;
+	static double cur_angle = 0.0f;
+
+	double diff_distance = 0.0f;
+	double diff_angle = 0.0f;
+
+	static int has_event_mask = 0;
+
+	static Time base_time = 0;
+	Time current_time;
+
+	if( timer_expired )
+	{
+		if( state == GestureEnd )
+		{
+			current_time = GetTimeInMillis();
+			if( (current_time - base_time) >= PINCHROTATION_TIME_THRESHOLD )
+			{
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][Timer] You must move farther than dist threshold(=%.2f) or angle threshold(=%2f) within time threshold(=%d) !\n", PINCHROTATION_DIST_THRESHOLD, PINCHROTATION_ANGLE_THRESHOLD, PINCHROTATION_TIME_THRESHOLD);
+#endif//__DETAIL_DEBUG__
+				goto cleanup_pinchrotation;
+			}
+		}
+
+		return;
+	}
+
+	switch( type )
+	{
+		case ET_ButtonPress:
+			g_pGesture->fingers[idx].flags |= PressFlagPinchRotation;
+
+			if( g_pGesture->num_pressed < 2 )
+				return;
+
+			if( g_pGesture->num_pressed < num_pressed && state != GestureEnd )
+			{
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][P][cleanup] num_finger changed ! num_pressed=%d, g_pGesture->num_pressed=%d\n", num_pressed, g_pGesture->num_pressed);
+#endif//__DETAIL_DEBUG__
+				goto cleanup_pinchrotation;
+			}
+
+			if( base_distance == 0.0f && g_pGesture->num_pressed == 2 )
+			{
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][First Time !!!] num_pressed=%d, g_pGesture->num_pressed=%d\n", num_pressed, g_pGesture->num_pressed);
+#endif//__DETAIL_DEBUG__
+
+				base_time = GetTimeInMillis();
+				pixman_region_init(&base_area);
+				pixman_region_union(&base_area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[1]);
+
+				prev_distance = base_distance = AREA_DIAG_LEN(&base_area.extents);
+
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][P] x1=%d, x2=%d, y1=%d, y2=%d\n", g_pGesture->fingers[0].px, g_pGesture->fingers[1].px,
+				g_pGesture->fingers[0].py, g_pGesture->fingers[1].py);
+#endif//__DETAIL_DEBUG__
+
+				prev_angle = base_angle = get_angle(g_pGesture->fingers[0].px, g_pGesture->fingers[0].py, g_pGesture->fingers[1].px, g_pGesture->fingers[1].py);
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][P] base_angle=%.2f(deg=%.2f)\n", base_angle, rad2degree(base_angle));
+#endif//__DETAIL_DEBUG__
+				event_type = GestureNotifyPinchRotation;
+				pinchrotation_event_timer = TimerSet(pinchrotation_event_timer, 0, PINCHROTATION_TIME_THRESHOLD, GestureEventTimerHandler, (int *)&event_type);
+			}
+			num_pressed = g_pGesture->num_pressed;
+
+#ifdef __DETAIL_DEBUG__
+			ErrorF("[GroupPinchRotation][P][num_pressed=%d] AREA_SIZE(base_area.extents)=%d\n", num_pressed, AREA_SIZE(&base_area.extents));
+			ErrorF("[GroupPinchRotation][P][num_pressed=%d] base_distance=%.2f, base_angle=%.2f(deg=%.2f)\n", num_pressed, base_distance, base_angle, rad2degree(base_angle));
+#endif//__DETAIL_DEBUG__
+			break;
+
+		case ET_Motion:
+			if( !(g_pGesture->fingers[idx].flags & PressFlagPinchRotation) )
+				break;
+
+			if( (num_pressed != g_pGesture->num_pressed) && (state != GestureEnd) )
+			{
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][M][cleanup] num_finger changed ! num_pressed=%d, g_pGesture->num_pressed=%d\n", num_pressed, g_pGesture->num_pressed);
+#endif//__DETAIL_DEBUG__
+				goto cleanup_pinchrotation;
+			}
+
+			if( num_pressed < 2 )
+				return;
+
+			if( g_pGesture->fingers[0].mx && g_pGesture->fingers[0].my && g_pGesture->fingers[1].mx && g_pGesture->fingers[1].my )
+			{
+				pixman_region_init(&cur_area);
+				pixman_region_union(&cur_area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[1]);
+
+				cur_distance = AREA_DIAG_LEN(&cur_area.extents);
+
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][M] x1=%d, x2=%d, y1=%d, y2=%d\n", g_pGesture->fingers[0].mx, g_pGesture->fingers[1].mx,
+				g_pGesture->fingers[0].my, g_pGesture->fingers[1].my);
+#endif//__DETAIL_DEBUG__
+
+				cur_angle = get_angle(g_pGesture->fingers[0].mx, g_pGesture->fingers[0].my, g_pGesture->fingers[1].mx, g_pGesture->fingers[1].my);
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][M] cur_angle=%.2f(deg=%.2f)\n", cur_angle, rad2degree(cur_angle));
+#endif//__DETAIL_DEBUG__
+
+				diff_distance = prev_distance - cur_distance;
+				diff_angle = prev_angle - cur_angle;
+
+				cx = AREA_CENTER_X(&cur_area.extents);
+				cy = AREA_CENTER_Y(&cur_area.extents);
+
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][M][state=%d] cx=%d, cy=%d\n", state, cx, cy);
+#endif//__DETAIL_DEBUG__
+
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][M][num_pressed=%d] prev_distance=%.2f, cur_distance=%.2f, diff=%.2f\n", num_pressed, prev_distance, cur_distance, diff_distance);
+				ErrorF("[GroupPinchRotation][M][num_pressed=%d] prev_angle=%.2f(deg=%.2f), cur_angle=%.2f(deg=%.2f), diff=%.2f(deg=%.2f)\n", num_pressed, prev_angle, rad2degree(prev_angle), cur_angle, rad2degree(cur_angle), diff_angle, rad2degree(diff_angle));
+#endif//__DETAIL_DEBUG__
+
+				switch( state )
+				{
+					case GestureEnd:
+						if( (ABS(diff_distance) >= PINCHROTATION_DIST_THRESHOLD) || (ABS(diff_angle) >= PINCHROTATION_ANGLE_THRESHOLD) )
+						{
+#ifdef __DETAIL_DEBUG__
+							if( ABS(diff_distance) >= PINCHROTATION_DIST_THRESHOLD )
+								ErrorF("[GroupPinchRotation][M] zoom changed !\n");
+
+							if( ABS(diff_angle) >= PINCHROTATION_ANGLE_THRESHOLD )
+								ErrorF("[GroupPinchRotation][M] angle changed !\n");
+#endif//__DETAIL_DEBUG__
+
+							TimerCancel(pinchrotation_event_timer);
+							state = GestureBegin;
+							goto gesture_begin_handle;
+						}
+						break;
+
+					case GestureBegin:
+gesture_begin_handle:
+#ifdef __DETAIL_DEBUG__
+						ErrorF("[GroupPinchRotation] PINCHROTATION Begin !cx=%d, cy=%d, state=%d\n", cx, cy, state);
+#endif//__DETAIL_DEBUG__
+						if( GestureHasFingerEventMask(GestureNotifyPinchRotation, num_pressed) )
+						{
+							GestureHandleGesture_PinchRotation(num_pressed, cur_distance / base_distance, (cur_angle > base_angle) ? (cur_angle-base_angle) : (RAD_360DEG + cur_angle - base_angle), cur_distance, cx, cy, GestureBegin);
+							prev_distance = cur_distance;
+							prev_angle = cur_angle;
+							state = GestureUpdate;
+							has_event_mask = 1;
+						}
+						else
+						{
+							has_event_mask = 0;
+							goto cleanup_pinchrotation;
+						}
+						break;
+
+					case GestureUpdate:
+						//if( ABS(diff_distance) < PINCHROTATION_DIST_THRESHOLD && ABS(diff_angle) < PINCHROTATION_ANGLE_THRESHOLD )
+						//	break;
+
+#ifdef __DETAIL_DEBUG__
+						if( ABS(diff_distance) >= PINCHROTATION_DIST_THRESHOLD )
+							ErrorF("[GroupPinchRotation][M] zoom changed !\n");
+
+						if( ABS(diff_angle) >= PINCHROTATION_ANGLE_THRESHOLD )
+							ErrorF("[GroupPinchRotation][M] angle changed !\n");
+#endif//__DETAIL_DEBUG__
+
+#ifdef __DETAIL_DEBUG__
+						ErrorF("[GroupPinchRotation] PINCHROTATION Update ! cx=%d, cy=%d, state=%d\n", cx, cy, state);
+#endif//__DETAIL_DEBUG__
+						GestureHandleGesture_PinchRotation(num_pressed, cur_distance / base_distance, (cur_angle > base_angle) ? (cur_angle-base_angle) : (RAD_360DEG + cur_angle - base_angle), cur_distance, cx, cy, GestureUpdate);
+						prev_distance = cur_distance;
+						prev_angle = cur_angle;
+						break;
+
+					case GestureDone:
+					default:
+						break;
+				}
+			}
+			break;
+
+		case ET_ButtonRelease:
+			if( state != GestureEnd && num_pressed >= 2)
+			{
+#ifdef __DETAIL_DEBUG__
+				ErrorF("[GroupPinchRotation][R][cleanup] num_finger changed ! num_pressed=%d, g_pGesture->num_pressed=%d\n", num_pressed, g_pGesture->num_pressed);
+#endif//__DETAIL_DEBUG__
+				goto cleanup_pinchrotation;
+			}
+
+			if( g_pGesture->num_pressed )
+				break;
+
+			goto cleanup_pinchrotation;
+			break;
+	}
+
+	return;
+
+cleanup_pinchrotation:
+
+	if(  has_event_mask  && (state == GestureBegin || state == GestureUpdate) )
+	{
+		state = GestureEnd;
+#ifdef __DETAIL_DEBUG__
+		ErrorF("[GroupPinchRotation] PINCHROTATION End ! cx=%d, cy=%d, state=%d\n", cx, cy, state);
+#endif//__DETAIL_DEBUG__
+		GestureHandleGesture_PinchRotation(num_pressed, cur_distance / base_distance, (cur_angle > base_angle) ? (cur_angle-base_angle) : (RAD_360DEG + cur_angle - base_angle), cur_distance, cx, cy, GestureEnd);
+	}
+	else
+	{
+		g_pGesture->recognized_gesture &= ~PinchRotationFilterMask;
+	}
+
 	g_pGesture->filter_mask |= PinchRotationFilterMask;
+
+	if( g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL )
+	{
+#ifdef __DETAIL_DEBUG__
+		ErrorF("[GroupPinchRotation][cleanup] GestureFlushOrDrop() !\n");
+#endif//__DETAIL_DEBUG__
+
+		if( ERROR_INVALPTR == GestureFlushOrDrop() )
+		{
+			GestureControl(g_pGesture->this_device, DEVICE_OFF);
+		}
+	}
+
+	prev_distance = base_distance = 0.0f;
+	prev_angle = base_angle = 0.0f;
+	has_event_mask = num_pressed = 0;
+	state = GestureEnd;
+	cx = cy = 0;
+	TimerCancel(pinchrotation_event_timer);
 	return;
 }
 
@@ -1642,6 +1951,13 @@ GestureEventTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
 			GestureRecognize_GroupTapNHold(event_type, NULL, NULL, 0, 1);
 			break;
 
+		case GestureNotifyPinchRotation:
+#ifdef __DETAIL_DEBUG__
+			ErrorF("[GestureEventTimerHandler] GestureNotifyPinchRotation (event_type = %d)\n", event_type);
+#endif//__DETAIL_DEBUG__
+			GestureRecognize_GroupPinchRotation(event_type, NULL, NULL, 0, 1);
+			break;
+
 		default:
 #ifdef __DETAIL_DEBUG__
 			ErrorF("[GestureEventTimerHandler] unknown event_type (=%d)\n", event_type);
@@ -1675,13 +1991,23 @@ void
 GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 {
 	int i;
-	int idx = device->id - g_pGesture->first_fingerid;
 	static OsTimerPtr single_finger_timer = NULL;
+	int idx = -1;
 
-	if( PROPAGATE_EVENTS == g_pGesture->ehtype )
+	if( PROPAGATE_EVENTS == g_pGesture->ehtype ||
+		device->id < g_pGesture->first_fingerid )
 		return;
 
-	if( device->id < g_pGesture->first_fingerid )//filtering device id : 2
+	for( i = 0 ; i < g_pGesture->num_mt_devices ; i++ )
+	{
+		if( device->id == g_pGesture->mt_devices[i]->id )
+		{
+			idx = i;
+			break;
+		}
+	}
+
+	if( idx < 0 )
 		return;
 
 	switch( type )
@@ -1827,7 +2153,7 @@ GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 		}
 		if( !(g_pGesture->filter_mask & PinchRotationFilterMask) )
 		{
-			GestureRecognize_GroupPinchRotation(type, ev, device, idx);
+			GestureRecognize_GroupPinchRotation(type, ev, device, idx, 0);
 		}
 		if( !(g_pGesture->filter_mask & TapFilterMask) )
 		{

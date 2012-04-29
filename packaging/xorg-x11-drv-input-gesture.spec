@@ -5,11 +5,13 @@ Release:    4
 Group:      System/X Hardware Support
 License:    MIT
 Source0:    %{name}-%{version}.tar.gz
-Requires:   xorg-x11-server
+Requires:   xserver-xorg-core
 BuildRequires:  pkgconfig(xorg-server)
 BuildRequires:  pkgconfig(gestureproto)
 BuildRequires:  pkgconfig(xproto)
 BuildRequires:  pkgconfig(inputproto)
+BuildRequires:  pkgconfig(xorg-macros)
+
 %description
  This package provides the driver for recognizing gesture(s) using button
 and motion events inside X server.

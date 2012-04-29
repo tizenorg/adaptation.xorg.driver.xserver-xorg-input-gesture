@@ -59,6 +59,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define AREA_CENTER_Y(extents)	((extents)->y1 + (((extents)->y2-(extents)->y1)/2))
 #define AREA_SIZE(extents)		(ABS((extents)->x2-(extents)->x1)*ABS((extents)->y2-(extents)->y1))
 #define INBOX(r,x,y)				( ((r)->x2 >  x) && ((r)->x1 <= x) && ((r)->y2 >  y) && ((r)->y1 <= y) )
+#define AREA_HEIGHT(extents)    (((extents)->y2)-((extents)->y1))
+#define AREA_WIDTH(extents)	(((extents)->x2)-((extents)->x1))
+#define AREA_DIAG_LEN(extents)  sqrt((AREA_WIDTH(extents)*AREA_WIDTH(extents))+(AREA_HEIGHT(extents)*AREA_HEIGHT(extents)))
 
 //tap
 #define TAP_THRESHOLD			100//in pixel
@@ -95,6 +98,12 @@ enum
 #define PAN_UPDATE_MOVE_THRESHOLD	3//pixel
 #define PAN_TIME_THRESHOLD			300//ms
 
+#define PINCHROTATION_TIME_THRESHOLD		500//ms
+#define PINCHROTATION_INIT_DIST_THRESHOLD	25.0f
+#define PINCHROTATION_INIT_ANGLE_THRESHOLD	0.2f
+#define PINCHROTATION_DIST_THRESHOLD		25.0f
+#define PINCHROTATION_ANGLE_THRESHOLD		0.2f
+
 #define HOLD_AREA_THRESHOLD			2500//=50pixel * 50pixel
 #define HOLD_MOVE_THRESHOLD			10//pixel
 #define HOLD_TIME_THRESHOLD			500//ms
@@ -115,6 +124,12 @@ enum
 #define FLICK_AREA_TIMEOUT				700//ms
 #define FLICK_MOVE_THRESHOLD			100//pixel
 #define FLICK_MOVE_TIMEOUT				1000//ms
+
+#define RAD_90DEG  M_PI_2
+#define RAD_180DEG M_PI
+#define RAD_270DEG (M_PI_2 * 3)
+#define RAD_360DEG (M_PI * 2)
+#define rad2degree(r) ((r) * 180/M_PI)
 
 typedef enum _MTSyncType
 {
