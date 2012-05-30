@@ -5,6 +5,7 @@ Release:    4
 Group:      System/X Hardware Support
 License:    MIT
 Source0:    %{name}-%{version}.tar.gz
+Source1001: packaging/xorg-x11-drv-input-gesture.manifest 
 Requires:   xserver-xorg-core
 BuildRequires:  pkgconfig(xorg-server)
 BuildRequires:  pkgconfig(gestureproto)
@@ -30,6 +31,7 @@ xorg-x11-drv-input-gesture development files
 %setup -q 
 
 %build
+cp %{SOURCE1001} .
 
 autoreconf -vfi
 ./configure --prefix=/usr --mandir=/usr/share/man --infodir=/usr/share/info CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
@@ -43,8 +45,10 @@ rm -rf %{buildroot}
 %remove_docs
 
 %files
+%manifest xorg-x11-drv-input-gesture.manifest
 %{_libdir}/xorg/modules/input/gesture_drv.so
 
 %files devel
+%manifest xorg-x11-drv-input-gesture.manifest
 %{_libdir}/pkgconfig/xorg-gesture.pc
 
