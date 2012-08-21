@@ -1,13 +1,13 @@
-Name:       xorg-x11-drv-input-gesture
+#sbs-git:slp/pkgs/xorg/driver/xserver-xorg-input-gesture xorg-x11-drv-gesture 0.1.0 fb1092a8ea453d658b38d5c28e67a58462d7c931
+Name:	xorg-x11-drv-gesture
 Summary:    X.Org X server -- Xserver gesture driver
-Version:	0.1.0
+Version: 0.1.0
 Release:    4
 Group:      System/X Hardware Support
 License:    MIT
 Source0:    %{name}-%{version}.tar.gz
-Requires:   xserver-xorg-core
 BuildRequires:  pkgconfig(xorg-server)
-BuildRequires:  pkgconfig(gestureproto)
+BuildRequires:  xorg-x11-proto-gesture
 BuildRequires:  pkgconfig(xproto)
 BuildRequires:  pkgconfig(inputproto)
 BuildRequires:  pkgconfig(xorg-macros)
@@ -23,7 +23,7 @@ Group:      Development/Libraries
 Requires:   %{name} = %{version}-%{release}
 
 %description devel
-xorg-x11-drv-input-gesture development files
+xorg-x11-drv-gesture development files
 
 
 %prep
@@ -33,6 +33,7 @@ xorg-x11-drv-input-gesture development files
 
 autoreconf -vfi
 ./configure --prefix=/usr --mandir=/usr/share/man --infodir=/usr/share/info CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
+#./configure --prefix=/usr --mandir=/usr/share/man --infodir=/usr/share/info CFLAGS="$CFLAGS -D__DETAIL_DEBUG__ -D__DEBUG_EVENT_HANDLER__ " LDFLAGS="$LDFLAGS"
 
 make %{?jobs:-j%jobs}
 

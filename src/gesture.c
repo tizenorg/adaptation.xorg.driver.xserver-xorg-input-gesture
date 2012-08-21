@@ -73,7 +73,7 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <xorg/mi.h>
 
 //Basic functions
-static InputInfoPtr GesturePreInit(InputDriverPtr  drv, IDevPtr dev, int flags);
+static InputInfoPtr GesturePreInit(InputDriverPtr  drv, InputInfoPtr pInfo, int flags);
 static void GestureUnInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags);
 static pointer GesturePlug(pointer module, pointer options, int *errmaj, int  *errmin);
 static void GestureUnplug(pointer p);
@@ -812,7 +812,7 @@ cleanup_pinchrotation:
 
 	if( g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL )
 	{
-#ifdef __DETAIL_DEBUG__
+#if 1//def __DETAIL_DEBUG__
 		ErrorF("[GroupPinchRotation][cleanup] GestureFlushOrDrop() !\n");
 #endif//__DETAIL_DEBUG__
 
@@ -2779,46 +2779,43 @@ GestureUnplug(pointer p)
 }
 
 static InputInfoPtr
-GesturePreInit(InputDriverPtr drv, IDevPtr dev, int flags)
+GesturePreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
 {
-    InputInfoPtr        pInfo;
+    int rc = BadAlloc;
     GestureDevicePtr    pGesture;
 
-    if (!(pInfo = xf86AllocateInput(drv, 0)))
-        return NULL;
-
     pGesture = calloc(1, sizeof(GestureDeviceRec));
+
     if (!pGesture) {
         pInfo->private = NULL;
-        xf86DeleteInput(pInfo, 0);
-        return NULL;
+        //xf86DeleteInput(pInfo, 0);
+        goto error;
     }
 
     g_pGesture = pGesture;
     pInfo->private = pGesture;
-    pInfo->name = xstrdup(dev->identifier);
     pInfo->flags = 0;
-    pInfo->type_name = XI_MOUSE; /* see XI.h */
-    pInfo->conf_idev = dev;
     pInfo->read_input = GestureReadInput; /* new data avl */
     pInfo->switch_mode = NULL; /* toggle absolute/relative mode */
     pInfo->device_control = GestureControl; /* enable/disable dev */
     /* process driver specific options */
-    pGesture->device = xf86SetStrOption(dev->commonOptions, "Device", "/dev/null");
-    pGesture->is_active = xf86SetIntOption(dev->commonOptions, "Activate", 0);
+    pGesture->device = xf86SetStrOption(pInfo->options, "Device", "/dev/null");
+    pGesture->is_active = xf86SetIntOption(pInfo->options, "Activate", 0);
     pGesture->gestureWin = None;
 
     xf86Msg(X_INFO, "%s: Using device %s.\n", pInfo->name, pGesture->device);
 
     /* process generic options */
-    xf86CollectInputOptions(pInfo, NULL, NULL);
+    xf86CollectInputOptions(pInfo, NULL);
     xf86ProcessCommonOptions(pInfo, pInfo->options);
 
     pInfo->fd = -1;
-    pInfo->flags |= XI86_POINTER_CAPABLE;
-    pInfo->flags |= XI86_OPEN_ON_INIT;
-    pInfo->flags |= XI86_CONFIGURED;
-    return pInfo;
+    return Success;
+
+error:
+    if (pInfo->fd >= 0)
+        close(pInfo->fd);
+    return rc;
 }
 
 static void
