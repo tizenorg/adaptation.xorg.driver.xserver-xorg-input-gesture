@@ -10,6 +10,7 @@ BuildRequires:  pkgconfig(xorg-server)
 BuildRequires:  xorg-x11-proto-gesture
 BuildRequires:  pkgconfig(xproto)
 BuildRequires:  pkgconfig(inputproto)
+BuildRequires:  pkgconfig(resourceproto)
 BuildRequires:  pkgconfig(xorg-macros)
 
 %description
@@ -27,7 +28,7 @@ xorg-x11-drv-gesture development files
 
 
 %prep
-%setup -q 
+%setup -q
 
 %build
 
