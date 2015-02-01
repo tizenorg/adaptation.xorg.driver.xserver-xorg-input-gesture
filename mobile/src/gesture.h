@@ -45,6 +45,13 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define ABS_CNT (ABS_MAX+1)
 #endif
 
+/**
+ * If there's touch event in pointed window and there's no reponse, we just assume that client looks like deadlock.
+ * In this case, we will make a popup window and terminate application.
+ * To support this feature, we use SUPPORT_ANR_WITH_INPUT_EVENT flag.
+ */
+#define SUPPORT_ANR_WITH_INPUT_EVENT
+
 #define NUM_PASSKEYS	20
 
 #define SYSCALL(call) while (((call) == -1) && (errno == EINTR))
@@ -56,6 +63,9 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define GESTURE_EQ_SIZE	256
 
 #define GESTURE_RECOGNIZER_ONOFF	"GESTURE_RECOGNIZER_ONOFF"
+#define GESTURE_PALM_REJECTION_MODE	"GESTURE_PALM_REJECTION_MODE"
+#define CHECK_APPLICATION_NOT_RESPONSE_IN_INPUT_EVENT "_CHECK_APPLICATION_NOT_RESPONSE_IN_INPUT_EVENT_"
+#define ANR_EVENT_WINDOW "_ANR_EVENT_WINDOW_"
 
 #define FINGER_WIDTH		10
 #define FINGER_HEIGHT		10
@@ -99,6 +109,13 @@ enum
 	FLICK_NORTHWESTWARD
 };
 
+/* Gesture query devices infomation and register handlers
+  * if a device_control function is called using DEVICE_READY */
+#define DEVICE_READY 11
+
+#define SCREEN_WIDTH				720
+#define SCREEN_HEIGHT				1280
+
 #define PAN_AREA_THRESHOLD			10000//=100pixel * 100pixel
 #define PAN_MOVE_THRESHOLD			5//pixel
 #define PAN_UPDATE_MOVE_THRESHOLD	3//pixel
@@ -114,12 +131,12 @@ enum
 #define HOLD_MOVE_THRESHOLD			10//pixel
 #define HOLD_TIME_THRESHOLD			500//ms
 
-#define TAP_AREA_THRESHOLD			10000//= 100pixel * 100pixel
-#define TAP_MOVE_THRESHOLD			200//pixel
+#define TAP_AREA_THRESHOLD			30000//= 300pixel * 100pixel
+#define TAP_MOVE_THRESHOLD			300//pixel
 #define SGL_FINGER_TIME_THRESHOLD	50//ms
 #define SGL_TAP_TIME_THRESHOLD		200//ms
 #define DBL_TAP_TIME_THRESHOLD		400//ms
-#define MAX_TAP_REPEATS				3
+#define MAX_TAP_REPEATS				2
 
 #define TAPNHOLD_AREA_THRESHOLD			4900//= 70pixel * 70pixel
 #define TAPNHOLD_MOVE_THRESHOLD			50//pixel
@@ -409,11 +426,10 @@ enum
 
 #define GESTURE_FILTER_MASK_ALL	0x3f//(FlickFilterMask | PanFilterMask | PinchRotationFilterMask | TapFilterMask |TapNHoldFilterMask | HoldFilterMask)
 
-#define PalmHoldFilterMask				0x01//(1 << 0)
-#define PalmFlickHorizFilterMask		0x02//(1 << 1)
-#define PalmFlickVertiFilterMask		0x04//(1 << 2)
+#define PalmFlickHorizFilterMask		0x01//(1 << 0)
+#define PalmFlickVertiFilterMask		0x02//(1 << 1)
 
-#define GESTURE_PALM_FILTER_MASK_ALL	0x07//(PalmHoldFilterMask | PalmFlickHorizFilterMask | PalmFlickVertiFilterMask)
+#define GESTURE_PALM_FILTER_MASK_ALL	0x03//(PalmFlickHorizFilterMask | PalmFlickVertiFilterMask)
 
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 #define BezelFlickFilterMask		0x01//(1 << 0)
@@ -443,6 +459,13 @@ typedef struct _tagCurrentTouchStatus
 	int cy;		//current y
 } CurTouchStatus;
 
+//palm global
+#define PALM_MIN_TOUCH_MAJOR				30
+#define PALM_MIN_WIDTH_MAJOR				40
+#define PALM_MIN_TOUCH_MAJOR_BEZEL			16
+#define PALM_MIN_WIDTH_MAJOR_BEZEL			24
+#define PALM_BEZEL							33
+
 //palm flick
 #define PALM_FLICK_INITIAL_TIMEOUT			300//ms
 #define PALM_FLICK_FALSE_TIMEOUT			900//ms
@@ -456,7 +479,7 @@ typedef struct _tagCurrentTouchStatus
 #define PALM_FALSE_FLICK_BASE_WIDTH			8
 #define PALM_FLICK_TOUCH_MAJOR				80
 #define PALM_FLICK_FINGER_MIN_TOUCH_MAJOR	15
-#define PALM_FLICK_HORIZ_MAX_MOVE_Y			300
+#define PALM_FLICK_HORIZ_MAX_MOVE_Y			400
 #define PALM_FLICK_VERTI_MAX_MOVE_X			300
 
 //palm tap
@@ -469,13 +492,6 @@ typedef struct _tagCurrentTouchStatus
 
 //palm hold
 #define PALM_HOLD_TIME_THRESHOLD			150
-#define PALM_HOLD_UPDATE_THRESHOLD			500
-#define PALM_HOLD_MIN_DEVIATION				120
-#define PALM_HOLD_MIN_FINGER				4
-#define PALM_HOLD_MIN_BASE_WIDTH			400
-#define PALM_HOLD_FALSE_WIDTH				10
-#define PALM_HOLD_FINGER_MIN_TOUCH_MAJOR	10
-#define PALM_HOLD_FINGER_MIN_WIDTH_MAJOR	15
 
 typedef struct _tagPalmTouchInfo
 {
@@ -537,6 +553,14 @@ typedef struct _tagPalmDrvStatus
 	int verti_coord[PALM_VERTI_ARRAY_COUNT];
 } PalmMiscInfo, *PalmMiscInfoPtr;
 
+typedef struct _tagStylusStatus
+{
+	CurTouchStatus t_status[MAX_MT_DEVICES];
+	int stylus_id;
+	Bool pen_detected;
+	Bool fake_events;
+} StylusInfo, *StylusInfoPtr;
+
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 typedef struct _tagBezelStatus
 {
@@ -569,6 +593,9 @@ typedef struct _GestureDeviceRec
 
 	int is_active;
 
+	int screen_width;
+	int screen_height;
+
 	int pinchrotation_time_threshold;
 	double pinchrotation_dist_threshold;
 	double pinchrotation_angle_threshold;
@@ -577,8 +604,18 @@ typedef struct _GestureDeviceRec
 	int singletap_threshold;
 	int doubletap_threshold;
 
+	int palm_min_touch_major;
+	int palm_min_width_major;
+	int palm_min_touch_major_bezel;
+	int palm_min_width_major_bezel;
+	int palm_bezel;
+
 	int touchkey_id;
 	MTSyncType mtsync_status;
+	StylusInfo stylusInfo;
+	int palm_rejection_mode;
+	Bool palm_detected;
+	Bool no_palm_events;
 
 	int pass_keycodes[NUM_PASSKEYS];
 
@@ -601,6 +638,7 @@ typedef struct _GestureDeviceRec
 	int has_hold_grabmask;
 	pixman_region16_t chold_area;
 	CurTouchStatus cts[MAX_MT_DEVICES];
+	Bool hold_detected;
 
 	PalmStatus palm;
 	PalmMiscInfo palm_misc;
@@ -611,6 +649,7 @@ typedef struct _GestureDeviceRec
 	int tpalm_idx;
 	int mt_px_idx;
 	int mt_py_idx;
+	int mt_tool_idx;
 
 	pixman_region16_t area;
 	pixman_region16_t finger_rects[MAX_MT_DEVICES];
@@ -643,6 +682,10 @@ typedef struct _GestureDeviceRec
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 	BezelFlickStatus bezel;
 #endif
+    WindowPtr anr_window;
+
+    int stylus_able;
+    int support_palm;
 } GestureDeviceRec, *GestureDevicePtr ;
 
 #endif//_GESTURE_H_

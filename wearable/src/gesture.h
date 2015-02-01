@@ -41,12 +41,25 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define HAVE_PROPERTIES 1
 #endif
 
+/**
+ * If there's touch event in pointed window and there's no reponse, we just assume that client looks like deadlock.
+ * In this case, we will make a popup window and terminate application.
+ * To support this feature, we use SUPPORT_ANR_WITH_INPUT_EVENT flag.
+ */
+#define SUPPORT_ANR_WITH_INPUT_EVENT
+
+#define GESTURE_RECOGNIZER_ONOFF	"GESTURE_RECOGNIZER_ONOFF"
+#define GESTURE_PALM_REJECTION_MODE	"GESTURE_PALM_REJECTION_MODE"
+#define CHECK_APPLICATION_NOT_RESPONSE_IN_INPUT_EVENT "_CHECK_APPLICATION_NOT_RESPONSE_IN_INPUT_EVENT_"
+#define ANR_EVENT_WINDOW "_ANR_EVENT_WINDOW_"
+
+
 #define SYSCALL(call) while (((call) == -1) && (errno == EINTR))
 #define RootWindow(dev) dev->spriteInfo->sprite->spriteTrace[0]
 #define CLIENT_BITS(id) ((id) & RESOURCE_CLIENT_MASK)
 #define CLIENT_ID(id) ((int)(CLIENT_BITS(id) >> CLIENTOFFSET))
 
-#define MAX_MT_DEVICES		10
+#define MAX_MT_DEVICES		2
 #define GESTURE_EQ_SIZE	256
 
 #define GESTURE_RECOGNIZER_ONOFF	"GESTURE_RECOGNIZER_ONOFF"
@@ -67,6 +80,10 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #define TAP_THRESHOLD			100//in pixel
 #define SINGLE_TAP_TIMEOUT		100//in msec
 #define DOUBLE_TAP_TIMEOUT	250//in msec
+
+//palm
+#define PALM_HORIZ_ARRAY_COUNT 3
+#define PALM_VERTI_ARRAY_COUNT 4
 
 typedef int XFixed;
 typedef double XDouble;
@@ -100,10 +117,10 @@ enum
 };
 
 #define TAP_AREA_THRESHOLD			10000//= 100pixel * 100pixel
-#define TAP_MOVE_THRESHOLD			70//pixel
+#define TAP_MOVE_THRESHOLD			35//pixel
 #define SGL_TAP_TIME_THRESHOLD		300//ms
 #define DBL_TAP_TIME_THRESHOLD		200//ms
-#define MAX_TAP_REPEATS             2
+#define MAX_TAP_REPEATS             3
 
 #define FLICK_AREA_THRESHOLD			22500//=150pixel * 150pixel
 #define FLICK_AREA_TIMEOUT				700//ms
@@ -112,11 +129,20 @@ enum
 #define FLICK_FALSE_Y_DIFF_COUNT		7
 #define FLICK_FALSE_X_DIFF_COUNT		5
 
+#define PALM_FLICK_DETECT_TIMEOUT			1000//ms
+#define PALM_FLICK_MAX_TOUCH_MAJOR		130
+
+#define AXIS_LABEL_PROP_ABS_MT_TRACKING_ID "Abs MT Tracking ID"
+#define AXIS_LABEL_PROP_ABS_MT_SLOT     "Abs MT Slot"
+#define AXIS_LABEL_PROP_ABS_MT_TOUCH_MAJOR "Abs MT Touch Major"
+#define AXIS_LABEL_PROP_ABS_MT_TOUCH_MINOR "Abs MT Touch Minor"
+#define AXIS_LABEL_PROP_ABS_MT_PALM        "Abs MT Palm/MT Sumsize"
 
 typedef enum _MTSyncType
 {
 	MTOUCH_FRAME_SYNC_END,
-	MTOUCH_FRAME_SYNC_BEGIN
+	MTOUCH_FRAME_SYNC_BEGIN,
+	MTOUCH_FRAME_SYNC_UPDATE
 } MTSyncType;
 
 typedef enum _EventHandleType
@@ -319,8 +345,11 @@ enum
 #define WFlickFilterMask				0x01//(1 << 0)
 #define WTapFilterMask				0x02//(1 << 1)
 #define WHoldFilterMask				0x04//(1 << 2)
+#define WPalmFlickFilterMask			0x08//(1 << 3)
 
-#define GESTURE_WATCH_FILTER_MASK_ALL	0x07//(WFlickFilterMask | WTapFilterMask | WHoldFilterMask)
+#define GESTURE_WATCH_FILTER_MASK_ALL	0x07//(WFlickFilterMask | WTapFilterMask | WHoldFilterMask )
+
+#define PALM_HOLD_TIME_THRESHOLD 150
 
 typedef struct _tagTouchStatus
 {
@@ -337,6 +366,24 @@ typedef struct _tagTouchStatus
 	Time mtime;	//motion time
 	Time rtime;	//current/previous release time
 } TouchStatus;
+
+typedef struct _tagCurrentTouchStatus
+{
+	int status;//One of BTN_RELEASED, BTN_PRESSED and BTN_MOVING
+	int cx;		//current x
+	int cy;		//current y
+} CurTouchStatus;
+
+typedef struct _tagPalmDrvStatus
+{
+	int enabled;
+	int scrn_width;
+	int scrn_height;
+	unsigned int half_scrn_area_size;
+	int horiz_coord[PALM_HORIZ_ARRAY_COUNT];
+	int verti_coord[PALM_VERTI_ARRAY_COUNT];
+} PalmMiscInfo, *PalmMiscInfoPtr;
+
 
 typedef struct _GestureDeviceRec
 {
@@ -361,16 +408,29 @@ typedef struct _GestureDeviceRec
 	int activate_flick_right;//left to right
 	int screen_width;
 	int screen_height;
+
 	int singletap_threshold;
 	int doubletap_threshold;
+	int tripletap_threshold;
+
+	int num_tap_repeated;
+
 	double hold_area_threshold;
 	int hold_move_threshold;
 	int hold_time_threshold;
+
+	int palm_flick_time_threshold;
+	int palm_flick_max_tmajor_threshold;
+	int palm_flick_min_tmajor_threshold;
+	char *factory_cmdname;
+
+	int max_mt_tmajor[MAX_MT_DEVICES];
 
 	int hwkey_id;
 	char *hwkey_name;
 	DeviceIntPtr hwkey_dev;
 	MTSyncType mtsync_status;
+	int mtsync_total_count;
 
 	DeviceIntPtr power_device;
 
@@ -388,6 +448,19 @@ typedef struct _GestureDeviceRec
 	IEventPtr	EQ;
 	int headEQ;
 	int tailEQ;
+
+	int hold_detector_activate;
+	int has_hold_grabmask;
+	pixman_region16_t chold_area;
+	CurTouchStatus cts[MAX_MT_DEVICES];
+	Bool hold_detected;
+
+	PalmMiscInfo palm_misc;
+	int tmajor_idx;
+	int tminor_idx;
+	int tpalm_idx;
+	int mt_px_idx;
+	int mt_py_idx;
 
 	pixman_region16_t area;
 	pixman_region16_t finger_rects[MAX_MT_DEVICES];
@@ -407,6 +480,8 @@ typedef struct _GestureDeviceRec
 	DeviceIntPtr mt_devices[MAX_MT_DEVICES];
 	DeviceIntPtr master_pointer;
 	DeviceIntPtr xtest_pointer;
+
+	WindowPtr anr_window;
 } GestureDeviceRec, *GestureDevicePtr ;
 
 #endif//_GESTURE_H_

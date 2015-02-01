@@ -1,8 +1,8 @@
 #sbs-git:slp/pkgs/xorg/driver/xserver-xorg-input-gesture xorg-x11-drv-gesture 0.1.0 fb1092a8ea453d658b38d5c28e67a58462d7c931
 Name:	xorg-x11-drv-gesture
 Summary:    X.Org X server -- Xserver gesture driver
-Version: 0.1.29
-Release:    7
+Version: 0.1.55
+Release:    1
 VCS:        adaptation/xorg/driver/xserver-xorg-input-gesture#xorg-x11-drv-gesture-0.1.2-8-6-g7c67de9af10190753599a01144e865bf0a341604
 Group:      System/X Hardware Support
 License:    MIT
@@ -13,7 +13,8 @@ BuildRequires:  pkgconfig(xproto)
 BuildRequires:  pkgconfig(inputproto)
 BuildRequires:  pkgconfig(resourceproto)
 BuildRequires:  pkgconfig(xorg-macros)
-%if "%{_repository}" == "mobile"
+BuildRequires:  pkgconfig(dlog)
+%if "%{?tizen_profile_name}" == "mobile"
 BuildRequires:  pkgconfig(xdbg)
 %endif
 
@@ -35,7 +36,7 @@ xorg-x11-drv-gesture development files
 
 %build
 
-%if "%{_repository}" == "wearable"
+%if "%{?tizen_profile_name}" == "wearable"
 cd wearable
 %else
 cd mobile
@@ -48,7 +49,7 @@ make %{?jobs:-j%jobs}
 
 %install
 
-%if "%{_repository}" == "wearable"
+%if "%{?tizen_profile_name}" == "wearable"
 cd wearable
 %else
 cd mobile

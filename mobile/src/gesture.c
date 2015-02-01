@@ -58,6 +58,8 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #endif
 
+#include <X11/Xatom.h>
+
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -75,9 +77,34 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #define MGEST	XDBG_M('G','E','S','T')
 
+static const void(*PalmRecognize)(int, InternalEvent*, DeviceIntPtr);
+
+#define _GESTUREPALMRECOGNIZE_(function, type, ev, device)	\
+	if(function)	\
+	{	\
+		XDBG_WARNING(MGEST, "[_GESTUREPALMRECOGNIZE_] Enable GesturePalmRecognize. type=%d\n", type);	\
+		function(type, ev, device);	\
+	}	\
+	else	\
+	{	\
+		XDBG_WARNING(MGEST, "[_GESTUREPALMRECOGNIZE_] Disable GesturePalmRecognize \n");	\
+	}	\
+
 static void printk(const char* fmt, ...) __attribute__((format(printf, 1, 0)));
 extern char *strcasestr(const char *s, const char *find);
 extern ScreenPtr miPointerCurrentScreen(void);
+extern EventQueuePtr mieqGetEventQueuePtr();
+
+static Bool GestureIsEventInMIEQ(int finger_index, enum EventType type);
+static int GestureGetFingerIndexFromDevice(DeviceIntPtr device);
+static int GestureGetDeviceIdFromFingerIndex(int finger_index);
+static Bool GestureIsPalmEventInMIEQ(void);
+static Bool GestureIsPalmEvent(InternalEvent *event);
+static int GestureGetMTToolValuator(InternalEvent *ev, DeviceIntPtr device);
+static void GestureRegisterTouchInfo(InternalEvent *ev, DeviceIntPtr device);
+static void GestureSetToolData(InternalEvent *ev, double val_tool);
+static void GestureCleanupTouch(int screen_num, InternalEvent *ev, DeviceIntPtr device);
+static void GestureChangeEventToFirstFingerEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
 
 //Basic functions
 static int GesturePreInit(InputDriverPtr  drv, InputInfoPtr pInfo, int flags);
@@ -111,17 +138,20 @@ static Bool GestureHasFingersEvents(int eventType);
 //Enqueued event handlers and enabler/disabler
 static ErrorStatus GestureEnableEventHandler(InputInfoPtr pInfo);
 static ErrorStatus GestureDisableEventHandler(void);
-static CARD32 GestureTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg);
 static CARD32 GestureEventTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg);
-static CARD32 GesturePalmEventTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg);
 void GestureHandleMTSyncEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
 void GestureHandleButtonPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
 void GestureHandleButtonReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
 void GestureHandleMotionEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
 void GestureHandleKeyPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
+void GestureHandleKeyReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device);
+
+static void GestureRegisterDeviceInfo(DeviceIntPtr device);
 
 //Gesture recognizer helper
+#if GET_ABI_MAJOR(ABI_XINPUT_VERSION) < 21
 static Bool PointInBorderSize(WindowPtr pWin, int x, int y);
+#endif
 static WindowPtr GestureWindowOnXY(int x, int y);
 Bool GestureHasFingerEventMask(int eventType, int num_finger);
 #ifdef _F_SUPPORT_BEZEL_FLICK_
@@ -151,7 +181,6 @@ ErrorStatus GestureFlushOrDrop(void);
 
 static int GesturePalmGetHorizIndexWithX(int x, int type);
 static int GesturePalmGetVertiIndexWithY(int y, int type);
-static void GesturePalmRecognize_Hold(int type, int idx, int timer_expired);
 static void GesturePalmRecognize_FlickHorizen(int type, int idx);
 static void GesturePalmRecognize_FlickVertical(int type,int idx);
 static int GesturePalmGetScreenInfo();
@@ -173,6 +202,13 @@ static int GestureSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr va
 #endif
 
 static Atom prop_gesture_recognizer_onoff = None;
+static Atom prop_gesture_palm_rejection_mode = None;
+
+#ifdef SUPPORT_ANR_WITH_INPUT_EVENT
+static Atom prop_anr_in_input_event = None;
+static Atom prop_anr_event_window = None;
+static Window prop_anr_event_window_xid = None;
+#endif
 
 GestureDevicePtr g_pGesture = NULL;
 _X_EXPORT InputDriverRec GESTURE = {
@@ -228,15 +264,54 @@ printk(const char* fmt, ...)
 	va_end(argptr);
 }
 
+#ifdef SUPPORT_ANR_WITH_INPUT_EVENT
+static WindowPtr
+_GestureFindANRWindow(DeviceIntPtr device)
+{
+    WindowPtr root=NULL;
+    WindowPtr anr_window=NULL;
+    Window anr_xid=0;
+    PropertyPtr pProp;
+    int rc=0;
+
+    root = RootWindow(device);
+
+    if( prop_anr_event_window == None )
+        prop_anr_event_window = MakeAtom(ANR_EVENT_WINDOW, strlen(ANR_EVENT_WINDOW), TRUE);
+
+    rc = dixLookupProperty (&pProp, root, prop_anr_event_window, serverClient, DixReadAccess);
+    if (rc == Success && pProp->data){
+        anr_xid = *(int*)pProp->data;
+    }
+
+    if( anr_xid != 0 )
+    {
+        rc = dixLookupWindow(&anr_window, anr_xid, serverClient, DixSetPropAccess);
+        if( rc == BadWindow )
+        {
+            XDBG_ERROR(MGEST, "Can't find ANR window !!\n");
+            anr_window = NULL;
+        }
+        prop_anr_event_window_xid = anr_xid;
+    }
+
+    XDBG_DEBUG(MGEST, "ANR Window is %#x. Ptr is %#x\n", anr_xid, anr_window);
+    return anr_window;
+}
+#endif
+
+#if GET_ABI_MAJOR(ABI_XINPUT_VERSION) < 21
 static Bool
 PointInBorderSize(WindowPtr pWin, int x, int y)
 {
     BoxRec box;
-    if( pixman_region_contains_point (&pWin->borderSize, x, y, &box) )
-	return TRUE;
-
+    if (pixman_region_contains_point (&pWin->borderSize, x, y, &box))
+    {
+        return TRUE;
+    }
     return FALSE;
 }
+#endif
 
 static WindowPtr
 GestureWindowOnXY(int x, int y)
@@ -424,14 +499,13 @@ GestureHandleGesture_Flick(int num_of_fingers, int distance, Time duration, int 
 		if(direction == FLICK_NORTHWARD || direction == FLICK_SOUTHWARD)
 			g_pGesture->recognized_palm |= PalmFlickVertiFilterMask;
 	}
-
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 	else if(num_of_fingers == 1)
 	{
 		g_pGesture->bezel_recognized_mask |= BezelFlickFilterMask;
 	}
-	else
 #endif
+	else
 		g_pGesture->recognized_gesture |= FlickFilterMask;
 
 	memset(&fev, 0, sizeof(xGestureNotifyFlickEvent));
@@ -583,7 +657,7 @@ void GestureHandleGesture_Hold(int num_fingers, int cx, int cy, Time holdtime, i
 #endif//__DETAIL_DEBUG__
 
 	if(num_fingers == 0)
-		g_pGesture->recognized_palm |= PalmHoldFilterMask;
+		g_pGesture->hold_detected = TRUE;
 	else
 		g_pGesture->recognized_gesture |= HoldFilterMask;
 	memset(&hev, 0, sizeof(xGestureNotifyHoldEvent));
@@ -917,7 +991,7 @@ GestureRecognize_GroupPinchRotation(int type, InternalEvent *ev, DeviceIntPtr de
 	static Time base_time = 0;
 	Time current_time;
 
-	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1
+	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1 || g_pGesture->hold_detected
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 			|| g_pGesture->bezel_recognized_mask)
 #else
@@ -1184,7 +1258,7 @@ GestureRecognize_GroupFlick(int type, InternalEvent *ev, DeviceIntPtr device, in
 	int area_size;
 	int flicked = 0;
 
-	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1
+	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1 || g_pGesture->hold_detected
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -1334,7 +1408,7 @@ GestureRecognize_GroupPan(int type, InternalEvent *ev, DeviceIntPtr device, int 
 	static OsTimerPtr pan_event_timer = NULL;
 	static int event_type = GestureNotifyPan;
 
-	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1
+	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1 || g_pGesture->hold_detected
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -1545,7 +1619,6 @@ GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int 
 	static int base_area_size = 0;
 
 	static Time base_time = 0;
-	Time current_time;
 
 	int cx, cy;
 	int area_size;
@@ -1557,13 +1630,12 @@ GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int 
 	static pixman_box16_t base_box_ext;
 
 	static int tap_repeat = 0;
-	static int prev_tap_repeat = 0;
 	static int prev_num_pressed = 0;
 
 	static OsTimerPtr tap_event_timer = NULL;
 	static int event_type = GestureNotifyTap;
 
-	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1
+	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1 || g_pGesture->hold_detected
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -1583,7 +1655,7 @@ GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int 
 				if( num_pressed )
 				{
 #ifdef __DETAIL_DEBUG__
-					XDBG_DEBUG(MGEST, "[Timer][state=1] Tap time expired !(num_pressed=%d, tap_repeat=%d)\n", tap_repeat, num_pressed, tap_repeat);
+					XDBG_DEBUG(MGEST, "[Timer][state=1] Tap time expired !(num_pressed=%d, tap_repeat=%d)\n", num_pressed, tap_repeat);
 #endif//__DETAIL_DEBUG__
 					state = GestureEnd;
 					goto cleanup_tap;
@@ -1601,7 +1673,7 @@ GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int 
 				}
 
 #ifdef __DETAIL_DEBUG__
-				XDBG_DEBUG(MGEST, "[Timer][state=2]  tap_repeat=%d, prev_tap_repeat=%d, num_pressed=%d\n", tap_repeat, prev_tap_repeat, num_pressed);
+				XDBG_DEBUG(MGEST, "[Timer][state=2]  tap_repeat=%d, num_pressed=%d\n", tap_repeat, num_pressed);
 #endif//__DETAIL_DEBUG__
 				if( GestureHasFingerEventMask(GestureNotifyTap, prev_num_pressed) )
 				{
@@ -1647,10 +1719,8 @@ GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int 
 
 			num_pressed = g_pGesture->num_pressed;
 
-			current_time = GetTimeInMillis();
-
 #ifdef __DETAIL_DEBUG__
-			XDBG_DEBUG(MGEST, "[P][num_pressed=%d] AREA_SIZE(area.extents)=%d, base_cx=%d, base_cy=%d, base_time=%d, current_time=%d\n", num_pressed, base_area_size, base_cx, base_cy, base_time, current_time);
+			XDBG_DEBUG(MGEST, "[P][num_pressed=%d] AREA_SIZE(area.extents)=%d, base_cx=%d, base_cy=%d, base_time=%d, current_time=%d\n", num_pressed, base_area_size, base_cx, base_cy, base_time, GetTimeInMillis());
 #endif//__DETAIL_DEBUG__
 			break;
 
@@ -1715,12 +1785,11 @@ GestureRecognize_GroupTap(int type, InternalEvent *ev, DeviceIntPtr device, int 
 				prev_num_pressed = num_pressed;
 			}
 
-			prev_tap_repeat = tap_repeat;
 			tap_repeat++;
 			g_pGesture->tap_repeated = tap_repeat;
 
 #ifdef __DETAIL_DEBUG__
-			XDBG_DEBUG(MGEST, "[R] tap_repeat=%d, prev_tap_repeat=%d, num_pressed=%d, prev_num_pressed=%d\n", tap_repeat, prev_tap_repeat, num_pressed, prev_num_pressed);
+			XDBG_DEBUG(MGEST, "[R] tap_repeat=%d, num_pressed=%d, prev_num_pressed=%d\n", tap_repeat, num_pressed, prev_num_pressed);
 #endif//__DETAIL_DEBUG__
 
 			if( num_pressed != prev_num_pressed || !GestureHasFingerEventMask(GestureNotifyTap, num_pressed) )
@@ -1812,7 +1881,7 @@ GestureRecognize_GroupTapNHold(int type, InternalEvent *ev, DeviceIntPtr device,
 	Time interval = 0;
 	Time holdtime = 0;
 
-	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1
+	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1 || g_pGesture->hold_detected
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -2081,7 +2150,7 @@ void GestureRecognize_GroupHold(int type, InternalEvent *ev, DeviceIntPtr device
 	static OsTimerPtr hold_event_timer = NULL;
 	static int event_type = GestureNotifyHold;
 
-	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1
+	if(g_pGesture->recognized_palm || g_pGesture->enqueue_fulled == 1 || g_pGesture->hold_detected
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -2390,8 +2459,6 @@ nonempty_eventmask:
 #endif
 #endif//__DETAIL_DEBUG__
 	g_pGesture->palm_filter_mask = 0;
-	if(mask & HoldFilterMask)
-		g_pGesture->palm_filter_mask |= PalmHoldFilterMask;
 	if(mask & FlickFilterMask)
 	{
 		g_pGesture->palm_filter_mask |= PalmFlickHorizFilterMask;
@@ -2506,30 +2573,6 @@ GestureEventTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
 	return 0;
 }
 
-static CARD32
-GesturePalmEventTimerHandler(OsTimerPtr timer,CARD32 time,pointer arg)
-{
-	int event_type = *(int *)arg;
-
-	switch( event_type )
-	{
-		case GestureNotifyHold:
-#ifdef __PALM_DETAIL_LOG__
-			XDBG_DEBUG(MGEST, "GestureNotifyHold (event_type = %d)\n", event_type);
-#endif//__PALM_DETAIL_LOG__
-			GesturePalmRecognize_Hold(event_type, 0, 1);
-			break;
-
-		default:
-#ifdef __PALM_DETAIL_LOG__
-			XDBG_DEBUG(MGEST, "unknown event_type (=%d)\n", event_type);
-#endif//__PALM_DETAIL_LOG__
-			break;
-	}
-
-	return 0;
-}
-
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 static CARD32
 GestureBezelSingleFingerTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
@@ -2582,17 +2625,6 @@ GesturePalmSingleFingerTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
 
 	return 0;
 }
-
-static CARD32
-GesturePalmHoldRapidHandler(OsTimerPtr timer, CARD32 time, pointer arg)
-{
-#ifdef __PALM_DETAIL_LOG__
-	XDBG_DEBUG(MGEST, "[%d] rapid timer in.....\n", __LINE__);
-#endif
-	GesturePalmRecognize_Hold(0, 0, 0);
-	return 0;
-}
-
 
 static int
 GesturePalmGetHorizIndexWithX(int x, int type)
@@ -2668,7 +2700,7 @@ GesturePalmGetVertiIndexWithY(int y, int type)
 	for(i = 0 ; i < PALM_VERTI_ARRAY_COUNT ; i++)
 	{
 #ifdef __PALM_DETAIL_LOG__
-		XDBG_DEBUG(MGEST, "pPalmMisc->horiz_coord[%d]=%d, x=%d\n", i, pPalmMisc->horiz_coord[i], y);
+		XDBG_DEBUG(MGEST, "pPalmMisc->verti_coord[%d]=%d, x=%d\n", i, pPalmMisc->verti_coord[i], y);
 #endif//__PALM_DETAIL_LOG__
 		if(y <= pPalmMisc->verti_coord[i])
 		{
@@ -2735,329 +2767,6 @@ index_check:
 }
 
 static void
-GesturePalmRecognize_Hold(int type, int idx, int timer_expired)
-{
-	static int is_holding = 1;
-	static int num_pressed = 0;
-	static Time base_time = 0;
-	static int cx, cy;
-	static int base_width_size = 0;
-
-	static int state = GestureEnd;
-	static int false_base_width_size_count = 0;
-	static int max_num_finger = 0;
-
-	static OsTimerPtr palm_hold_event_timer = NULL;
-	static int event_type = GestureNotifyHold;
-	PalmStatusPtr pPalm = &g_pGesture->palm;
-	static int hold_occured = 0;
-	static int rapid_hold = 0;
-	static OsTimerPtr palm_hold_rapid_timer = NULL;
-
-#ifdef __PALM_GESTURE_LOG__
-	XDBG_DEBUG(MGEST, "recognized_palm= 0x%x, palm_filter_mask= 0x%x\n", g_pGesture->recognized_palm, g_pGesture->palm_filter_mask);
-	XDBG_DEBUG(MGEST, "num_pressed: %d, cur_touched: %d, palm_flag: %d, is_holding: %d hold_occured %.f\n", num_pressed, pPalm->cur_touched, pPalm->palmflag, is_holding, hold_occured);
-	XDBG_DEBUG(MGEST, "pPalm->biggest_wmajor: %.f, pPalm->bigger_wmajor: %.f, pPalm->biggest_tmajor: %.f\n", pPalm->biggest_wmajor, pPalm->bigger_wmajor, pPalm->biggest_tmajor);
-#endif
-	if(g_pGesture->enqueue_fulled == 1)
-	{
-#ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "EQ Event is full.... palm recognize drop..\n");
-#endif
-		goto hold_failed;
-	}
-	if(rapid_hold && type==0 && idx==0 && timer_expired == 0)
-	{
-#ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "rapid timer is released .....\n");
-#endif
-		rapid_hold = 0;
-		goto release_hold;
-	}
-	if(pPalm->single_timer_expired && (pPalm->biggest_tmajor < PALM_HOLD_FINGER_MIN_TOUCH_MAJOR) && (max_num_finger < (PALM_HOLD_MIN_FINGER - 1)))
-	{
-#ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "No Hold single finger...expired, biggest_tmajor: %.f\n", pPalm->biggest_tmajor);
-#endif
-		goto hold_failed;
-	}
-
-	if(g_pGesture->recognized_gesture || (g_pGesture->recognized_palm && !(g_pGesture->recognized_palm & PalmHoldFilterMask)) || (g_pGesture->palm_filter_mask & PalmHoldFilterMask)
-#ifdef _F_SUPPORT_BEZEL_FLICK_
-		|| g_pGesture->bezel_recognized_mask)
-#else
-		)
-#endif
-	{
-#ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "zoom_enabled: %d\n", g_pGesture->zoom_enabled);
-		XDBG_DEBUG(MGEST, "type(%d) recognized_palm= 0x%x, palm_filter_mask= 0x%x\n", type, g_pGesture->recognized_palm, g_pGesture->palm_filter_mask);
-		XDBG_DEBUG(MGEST, "type(%d) recognized_gesture= 0x%x, filter_mask= 0x%x\n", type, g_pGesture->recognized_gesture, g_pGesture->filter_mask);
-#endif
-		goto hold_failed;
-	}
-	if( timer_expired && !pPalm->palmflag)
-	{
-#ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "No Palm is comming \n");
-#endif
-		if( (pPalm->biggest_wmajor > PALM_HOLD_FINGER_MIN_WIDTH_MAJOR) && (max_num_finger >= PALM_HOLD_MIN_FINGER) )
-		{
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "It seemed palm hold (biggest_wmajor: %.f max_num_finger: %d) \n", pPalm->biggest_wmajor, max_num_finger);
-#endif
-			pPalm->palmflag = 1;
-		}
-		else
-		{
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "No Palm and No Hold \n");
-#endif
-			goto hold_failed;
-		}
-	}
-
-	if( timer_expired && pPalm->palmflag)
-	{
-#ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "state: %d\n", state);
-#endif
-		if(max_num_finger < PALM_HOLD_MIN_FINGER)
-		{
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "palm hold false : max_num_finger(%d) < %d\n", max_num_finger, PALM_HOLD_MIN_FINGER);
-#endif
-			goto hold_failed;
-		}
-		if( state <= GestureBegin )
-			state++;
-
-		switch( state )
-		{
-			case GestureBegin:
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "HOLD Begin !(state=%d)\n", state);
-#endif
-				break;
-
-			case GestureUpdate:
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "HOLD Update !(state=%d)\n", state);
-#endif
-				break;
-		}
-
-		if(base_width_size < PALM_HOLD_MIN_BASE_WIDTH)
-		{
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "[P] No Hold base_width_size: %d < %d\n", base_width_size, PALM_HOLD_MIN_BASE_WIDTH);
-#endif
-			goto hold_failed;
-		}
-
-		if( GestureHasFingerEventMask(GestureNotifyHold, 0) )
-		{
-			if(state == GestureBegin)
-			{
-				hold_occured = 1;
-			}
-			GestureHandleGesture_Hold(0, cx, cy, GetTimeInMillis()-base_time, state);
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "[T] create hold timer @ timer expired\n");
-#endif
-			palm_hold_event_timer = TimerSet(palm_hold_event_timer, 0, PALM_HOLD_UPDATE_THRESHOLD, GesturePalmEventTimerHandler, (int *)&event_type);
-		}
-		return;
-	}
-
-	switch( type )
-	{
-		case ET_ButtonPress:
-			if(!is_holding)
-				break;
-			if(!base_time)
-			{
-				if(!base_time)
-					base_time = GetTimeInMillis();
-				event_type = GestureNotifyHold;
-				TimerCancel(palm_hold_event_timer);
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[P] create hold timer @ initial time\n");
-#endif
-				max_num_finger=0;
-				palm_hold_event_timer = TimerSet(palm_hold_event_timer, 0, PALM_HOLD_TIME_THRESHOLD, GesturePalmEventTimerHandler, (int *)&event_type);
-			}
-			base_width_size = AREA_WIDTH(&pPalm->area.extents);
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "[P] Hold base_width_size: %d\n", base_width_size);
-#endif
-			false_base_width_size_count = 0;
-			num_pressed++;
-			if(max_num_finger < num_pressed)
-				max_num_finger = num_pressed;
-			break;
-
-		case ET_Motion:
-			if(!num_pressed || !is_holding)
-				return;
-
-			if(state < GestureBegin)
-			{
-				if( !(pPalm->palmflag) && pPalm->max_palm >= PALM_FLICK_MIN_PALM)
-					pPalm->palmflag = 1;
-				if(base_width_size < PALM_HOLD_MIN_BASE_WIDTH)
-				{
-					false_base_width_size_count++;
-#ifdef __PALM_GESTURE_LOG__
-					XDBG_DEBUG(MGEST, "[M] increase false_base_width_size_count: %d!, width: %.f\n", false_base_width_size_count, base_width_size);
-#endif
-					if(false_base_width_size_count > PALM_HOLD_FALSE_WIDTH)
-					{
-#ifdef __PALM_GESTURE_LOG__
-						XDBG_DEBUG(MGEST, "[M] No hold width!\n");
-#endif
-						goto hold_failed;
-					}
-				}
-			}
-
-			cx = AREA_CENTER_X(&pPalm->area.extents);
-			cy = AREA_CENTER_Y(&pPalm->area.extents);
-			break;
-
-		case ET_ButtonRelease:
-			if(--num_pressed < 0)
-				num_pressed = 0;
-
-			if(pPalm->cur_touched || num_pressed)
-				break;
-#ifdef __PALM_GESTURE_LOG__
-			XDBG_DEBUG(MGEST, "[R] All fingers were released ! state=%d, is_holding=%d, cur_touched=%d, num_pressed=%d\n",
-				state, is_holding, pPalm->cur_touched, num_pressed);
-#endif
-			if(!is_holding)
-				goto cleanup_hold;
-
-			if (hold_occured == 0 && state == GestureEnd)
-			{
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] Fast Release..\n");
-#endif
-				if( (pPalm->palmflag) && (base_width_size > PALM_HOLD_MIN_BASE_WIDTH))
-				{
-#ifdef __PALM_GESTURE_LOG__
-					XDBG_DEBUG(MGEST, "[R] seemed hold palm is came, base_width_size: %d..\n", base_width_size);
-#endif
-					if( GestureHasFingerEventMask(GestureNotifyHold, 0) )
-					{
-						hold_occured = 1;
-						state = GestureBegin;
-						GestureHandleGesture_Hold(0, cx, cy, GetTimeInMillis()-base_time, state);
-						rapid_hold = 1;
-						palm_hold_rapid_timer = TimerSet(palm_hold_rapid_timer, 0, PALM_HOLD_TIME_THRESHOLD, GesturePalmHoldRapidHandler,  NULL);
-#ifdef __PALM_GESTURE_LOG__
-						XDBG_DEBUG(MGEST, "[R] rapid hold begin !!\n");
-#endif
-						goto hold_failed;
-					}
-				}
-				else if( (pPalm->biggest_wmajor > PALM_HOLD_FINGER_MIN_WIDTH_MAJOR) && (max_num_finger >= PALM_HOLD_MIN_FINGER) )
-				{
-#ifdef __PALM_GESTURE_LOG__
-					XDBG_DEBUG(MGEST, "[R] seemed hold.. biggest_wmajor: %.f, max_num_finger: %d", pPalm->biggest_wmajor, max_num_finger);
-#endif
-					if( GestureHasFingerEventMask(GestureNotifyHold, 0) )
-					{
-						hold_occured = 1;
-						state = GestureBegin;
-						GestureHandleGesture_Hold(0, cx, cy, GetTimeInMillis()-base_time, state);
-						rapid_hold = 1;
-						palm_hold_rapid_timer = TimerSet(palm_hold_rapid_timer, 0, PALM_HOLD_TIME_THRESHOLD, GesturePalmHoldRapidHandler,  NULL);
-#ifdef __PALM_GESTURE_LOG__
-						XDBG_DEBUG(MGEST, "[R] rapid hold begin !!\n");
-#endif
-						goto hold_failed;
-					}
-				}
-			}
-release_hold:
-			if(hold_occured == 0 && num_pressed == 0)
-			{
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] release all finger and No hold base_width_size: %d, biggest_wmajor: %.f, max_num_finger: %d\n", base_width_size, pPalm->biggest_wmajor, max_num_finger);
-#endif
-				goto hold_failed;
-			}
-
-			if( state == GestureBegin || state == GestureUpdate )
-			{
-				state = GestureEnd;
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] HOLD End !(state=%d)\n", state);
-#endif
-				hold_occured = 0;
-				//g_pGesture->recognized_palm = GESTURE_PALM_FILTER_MASK_ALL;
-				if( GestureHasFingerEventMask(GestureNotifyHold, 0) )
-				{
-					GestureHandleGesture_Hold(0, cx, cy, GetTimeInMillis()-base_time, state);
-				}
-				//else
-					//XDBG_DEBUG(MGEST, "[END] \n");
-			}
-			else
-			{
-#ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] Gesture Hold End is already occured\n");
-#endif
-				goto hold_failed;
-			}
-			goto cleanup_hold;
-	}
-	return;
-
-hold_failed:
-	is_holding = 0;
-	TimerCancel(palm_hold_event_timer);
-	g_pGesture->palm_filter_mask |= PalmHoldFilterMask;
-	if( g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL )
-	{
-		if( ERROR_INVALPTR == GestureFlushOrDrop() )
-		{
-			GestureControl(g_pGesture->this_device, DEVICE_OFF);
-		}
-	}
-#ifdef __PALM_GESTURE_LOG__
-	XDBG_DEBUG(MGEST, "[F] recognized_palm= 0x%x, palm_filter_mask: 0x%x\n", g_pGesture->recognized_palm, g_pGesture->palm_filter_mask);
-#endif
-	goto cleanup_hold;
-	return;
-
-cleanup_hold:
-#ifdef __PALM_GESTURE_LOG__
-	XDBG_DEBUG(MGEST, "[F] HOLD Cleanup (state: %d)\n", state);
-#endif
-	TimerCancel(palm_hold_event_timer);
-	if(state == GestureBegin || state == GestureUpdate)
-	{
-		if( GestureHasFingerEventMask(GestureNotifyHold, 0) )
-		{
-			GestureHandleGesture_Hold(0, cx, cy, GetTimeInMillis()-base_time, GestureEnd);
-		}
-	}
-	is_holding = 1;
-	num_pressed = 0;
-	false_base_width_size_count = 0;
-	base_time = 0;
-	cx = cy = 0;
-	max_num_finger = 0;
-	state = GestureEnd;
-	base_width_size = 0;
-	hold_occured = 0;
-	rapid_hold = 0;
-	return;
-}
-
-static void
 GesturePalmRecognize_FlickHorizen(int type, int idx)
 {
 	static int curTouched = 0;
@@ -3071,7 +2780,6 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 #endif
 
 	int line_idx;
-	static int press_idx;
 	static int prev_line_idx;
 	static int horiz_line[PALM_HORIZ_ARRAY_COUNT];
 
@@ -3090,8 +2798,11 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 #ifdef __PALM_GESTURE_LOG__
 	XDBG_DEBUG(MGEST, "recognized_palm= 0x%x, palm_filter_mask= 0x%x\n", g_pGesture->recognized_palm, g_pGesture->palm_filter_mask);
 	XDBG_DEBUG(MGEST, "num_pressed: %d, cur_touched: %d palmflag: %d\n", num_pressed, pPalm->cur_touched, pPalm->palmflag);
-	XDBG_DEBUG(MGEST, "idx: %d, cx: %d, cy: %d\n", idx, pPalm->cx, pPalm->cy);
+	XDBG_DEBUG(MGEST, "idx: %d, cx: %d, cy: %d, type: %d, touch_status: %d\n", idx, pPalm->cx, pPalm->cy, type, pPalm->pti[idx].touch_status);
 #endif
+
+	if( idx < 0 )
+		goto flick_failed;
 
 	if(g_pGesture->enqueue_fulled == 1)
 	{
@@ -3109,7 +2820,8 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 		goto flick_failed;
 	}
 
-	if(g_pGesture->recognized_gesture || (g_pGesture->recognized_palm && !(g_pGesture->recognized_palm & PalmFlickHorizFilterMask)) || (g_pGesture->palm_filter_mask & PalmFlickHorizFilterMask)
+	if(g_pGesture->recognized_gesture || g_pGesture->hold_detected ||
+		(g_pGesture->recognized_palm && !(g_pGesture->recognized_palm & PalmFlickHorizFilterMask)) || (g_pGesture->palm_filter_mask & PalmFlickHorizFilterMask)
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -3141,14 +2853,14 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 					if(line_idx < 0)
 					{
 #ifdef __PALM_GESTURE_LOG__
-						XDBG_DEBUG(MGEST, "[P] line_idx is invalid.. base_x: %d, line_idx: %d\n", base_x, line_idx);
+						XDBG_DEBUG(MGEST, "[P] No line_idx is invalid.. base_x: %d, line_idx: %d\n", base_x, line_idx);
 #endif
 						goto flick_failed;
 					}
 
 					horiz_line[line_idx]++;
 					pass_count++;
-					press_idx = prev_line_idx = line_idx;
+					prev_line_idx = line_idx;
 					release_flag = 0;
 #ifdef __PALM_GESTURE_LOG__
 					XDBG_DEBUG(MGEST, "[P] Base_width=%d, base_x=%d, line_idx=%d\n", base_width_size, base_x, line_idx);
@@ -3159,7 +2871,7 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 				if(base_width_size > PALM_FLICK_HORIZ_MAX_BASE_WIDTH)
 				{
 #ifdef __PALM_GESTURE_LOG__
-					XDBG_DEBUG(MGEST, "[P] No flickBase_width=%d > MAX_WIDTH\n", base_width_size, PALM_FLICK_HORIZ_MAX_BASE_WIDTH);
+					XDBG_DEBUG(MGEST, "[P] No flickBase_width=%d > %d: MAX_WIDTH\n", base_width_size, PALM_FLICK_HORIZ_MAX_BASE_WIDTH);
 #endif
 					goto flick_failed;
 				}
@@ -3203,7 +2915,7 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 			if(line_idx < 0)
 			{
 #ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[M] line_idx is invalid.. base_x: %d, line_idx: %d\n", base_x, line_idx);
+				XDBG_DEBUG(MGEST, "[M] No line_idx is invalid.. base_x: %d, line_idx: %d\n", base_x, line_idx);
 #endif
 				goto flick_failed;
 			}
@@ -3223,7 +2935,12 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 			{
 				horiz_line[line_idx]++;
 				if(horiz_line[line_idx] > 2)
+				{
+#ifdef __PALM_GESTURE_LOG__
+					XDBG_DEBUG(MGEST, "[M] No flick ! horiz_line[%d]: %d > 2\n", line_idx, horiz_line[line_idx]);
+#endif
 					goto flick_failed;
+				}
 				pass_count++;
 			}
 			if(pass_count > 6)
@@ -3252,7 +2969,8 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 #ifdef __PALM_GESTURE_LOG__
 			XDBG_DEBUG(MGEST, "[M] duration =%d !\n", duration);
 #endif
-			if(!pPalm->palmflag && (duration >= PALM_FLICK_INITIAL_TIMEOUT))
+			if(((!pPalm->palmflag) && (pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR-20) && (pPalm->biggest_wmajor < PALM_FLICK_TOUCH_MAJOR-20)) &&
+			(duration >= PALM_FLICK_INITIAL_TIMEOUT))
 			{
 #ifdef __PALM_GESTURE_LOG__
 				XDBG_DEBUG(MGEST, "[M] No flick !(initial flick timeout : duration=%d)\n", duration);
@@ -3266,10 +2984,10 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 #endif
 				goto flick_failed;
 			}
-			if( (duration >= PALM_FLICK_FALSE_TIMEOUT) && (pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR) )
+			if( (duration >= PALM_FLICK_FALSE_TIMEOUT) && (pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR) && (pPalm->biggest_wmajor < PALM_FLICK_TOUCH_MAJOR))
 			{
 #ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[M] No flick !(press touch major(%.f < %.f) is little in duration(%d))\n", pPalm->biggest_tmajor, PALM_FLICK_TOUCH_MAJOR, duration);
+				XDBG_DEBUG(MGEST, "[M] No flick !(press touch major(%.f) width major (%.f) < (%.f) is little in duration(%d))\n", pPalm->biggest_tmajor, pPalm->biggest_wmajor, PALM_FLICK_TOUCH_MAJOR, duration);
 #endif
 				goto flick_failed;
 			}
@@ -3290,7 +3008,8 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 			base_width_size = AREA_WIDTH(&pPalm->area.extents);
 			if(num_pressed)
 				break;
-			if(!pPalm->palmflag)
+
+			if((!pPalm->palmflag) && (pPalm->biggest_tmajor < 100) && (pPalm->bigger_wmajor < 100))
 			{
 #ifdef __PALM_GESTURE_LOG__
 				XDBG_DEBUG(MGEST, "[R] No flick (No palm comming and all finger release))\n");
@@ -3329,10 +3048,10 @@ GesturePalmRecognize_FlickHorizen(int type, int idx)
 #endif
 				goto flick_failed;
 			}
-			if(pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR)
+			if((pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR) && (pPalm->biggest_wmajor < PALM_FLICK_TOUCH_MAJOR))
 			{
 #ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] No flick !(touch major(%.f < %d) is small...)\n", pPalm->biggest_tmajor, PALM_FLICK_TOUCH_MAJOR);
+				XDBG_DEBUG(MGEST, "[R] No flick !(touch major(%.f) width major(%.f) < %d) is small...)\n", pPalm->biggest_tmajor, pPalm->biggest_wmajor, PALM_FLICK_TOUCH_MAJOR);
 #endif
 				goto flick_failed;
 			}
@@ -3393,7 +3112,6 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 	static pixman_box16_t base_box_ext;
 
 	int line_idx;
-	static int press_idx;
 	static int prev_line_idx;
 	static int verti_line[PALM_VERTI_ARRAY_COUNT];
 
@@ -3411,16 +3129,20 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 	XDBG_DEBUG(MGEST, "recognized_palm= 0x%x, palm_filter_mask= 0x%x\n", g_pGesture->recognized_palm, g_pGesture->palm_filter_mask);
 	XDBG_DEBUG(MGEST, "num_pressed: %d, cur_touched: %d, palm_flag: %d, single_timer_expired: %d\n", num_pressed, pPalm->cur_touched, pPalm->palmflag, pPalm->single_timer_expired);
 #endif
+
+	if( idx < 0 )
+		goto flick_failed;
+
 	if(g_pGesture->enqueue_fulled == 1)
 	{
 #ifdef __PALM_GESTURE_LOG__
-		XDBG_DEBUG(MGEST, "EQ Event is full.... palm recognize drop..\n");
+		XDBG_DEBUG(MGEST, "EQ Event is full.... No palm recognize drop..\n");
 #endif
 		goto flick_failed;
 	}
 
-
-	if(g_pGesture->recognized_gesture || (g_pGesture->recognized_palm && !(g_pGesture->recognized_palm & PalmFlickVertiFilterMask)) || (g_pGesture->palm_filter_mask & PalmFlickVertiFilterMask)
+	if(g_pGesture->recognized_gesture || g_pGesture->hold_detected ||
+		(g_pGesture->recognized_palm && !(g_pGesture->recognized_palm & PalmFlickVertiFilterMask)) || (g_pGesture->palm_filter_mask & PalmFlickVertiFilterMask)
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 		|| g_pGesture->bezel_recognized_mask)
 #else
@@ -3460,11 +3182,16 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 					XDBG_DEBUG(MGEST, "[P] Base_height=%d, base_y=%d, line_idx=%d\n", base_height_size, base_y, line_idx);
 #endif
 					if(line_idx < 0)
+					{
+#ifdef __PALM_GESTURE_LOG__
+						XDBG_DEBUG(MGEST, "[P] No Base_height=%d, base_y=%d, line_idx=%d\n", base_height_size, base_y, line_idx);
+#endif
 						goto flick_failed;
+					}
 
 					verti_line[line_idx] = 1;
 					pass_count++;
-					press_idx = prev_line_idx = line_idx;
+					prev_line_idx = line_idx;
 					release_flag = 0;
 #ifdef __PALM_GESTURE_LOG__
 					XDBG_DEBUG(MGEST, "[P] Base_height=%d, base_y=%d, line_idx=%d\n", base_height_size, base_y, line_idx);
@@ -3510,7 +3237,12 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 #endif
 
 			if(line_idx < 0)
+			{
+#ifdef __PALM_GESTURE_LOG__
+				XDBG_DEBUG(MGEST, "[M] No line_idx: %d\n", line_idx);
+#endif
 				goto flick_failed;
+			}
 			if((prev_line_idx != line_idx) && verti_line[line_idx] && !release_flag)
 			{
 #ifdef __PALM_GESTURE_LOG__
@@ -3518,7 +3250,7 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 #endif
 				goto flick_failed;
 			}
-
+#if 0
 			if(pPalm->max_touched == 1)
 			{
 				if(ABS(AREA_CENTER_X(&pPalm->area.extents) - base_cx) > PALM_FLICK_VERTI_MAX_MOVE_X)
@@ -3529,7 +3261,7 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 					goto flick_failed;
 				}
 			}
-
+#endif
 			verti_line[line_idx] = 1;
 			if(prev_line_idx != line_idx)
 				pass_count++;
@@ -3545,7 +3277,8 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 			XDBG_DEBUG(MGEST, "[M] duration =%d !\n", duration);
 #endif
 
-			if(!pPalm->palmflag && (duration >= PALM_FLICK_INITIAL_TIMEOUT))
+			if(!pPalm->palmflag && (pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR-20) && (pPalm->biggest_wmajor < PALM_FLICK_TOUCH_MAJOR-20)
+				 && (duration >= PALM_FLICK_INITIAL_TIMEOUT))
 			{
 #ifdef __PALM_GESTURE_LOG__
 				XDBG_DEBUG(MGEST, "[M] No flick !(initial flick timeout : duration=%d)\n", duration);
@@ -3571,17 +3304,16 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 
 		case ET_ButtonRelease:
 			release_flag = 1;
-			if(pPalm->cur_touched)
-				break;
 
 			if(--num_pressed < 0)
 				num_pressed = 0;
 			if(num_pressed)
 				break;
-			if(!pPalm->palmflag)
+
+			if(!pPalm->palmflag && (pPalm->biggest_tmajor < 100) && (pPalm->bigger_wmajor < 100))
 			{
 #ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] num_pressed is 0\n");
+				XDBG_DEBUG(MGEST, "[R] No flick (No palm comming and all finger release))\n");
 #endif
 				goto flick_failed;
 			}
@@ -3597,7 +3329,12 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 #endif
 
 			if(line_idx < 0)
+			{
+#ifdef __PALM_GESTURE_LOG__
+				XDBG_DEBUG(MGEST, "[R] No line_idx: %d\n", line_idx);
+#endif
 				goto flick_failed;
+			}
 #ifdef __PALM_GESTURE_LOG__
 			XDBG_DEBUG(MGEST, "[R] duration=%d, disty=%d\n", duration, disty);
 #endif
@@ -3616,10 +3353,10 @@ GesturePalmRecognize_FlickVertical(int type,int idx)
 #endif
 				goto flick_failed;
 			}
-			if(pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR)
+			if(pPalm->biggest_tmajor < PALM_FLICK_TOUCH_MAJOR && pPalm->biggest_wmajor < PALM_FLICK_TOUCH_MAJOR)
 			{
 #ifdef __PALM_GESTURE_LOG__
-				XDBG_DEBUG(MGEST, "[R] No flick !(flick touch major(%.f < %d) is small!)\n", pPalm->biggest_tmajor, PALM_FLICK_TOUCH_MAJOR);
+				XDBG_DEBUG(MGEST, "[R] No flick !(flick touch major(%.f) width major(%.f) < %d) is small!)\n", pPalm->biggest_tmajor, pPalm->biggest_wmajor, PALM_FLICK_TOUCH_MAJOR);
 #endif
 				goto flick_failed;
 			}
@@ -3691,7 +3428,7 @@ GesturePalmGetScreenInfo()
 	pixman_region_init(&tarea);
 	pixman_region_init_rect(&tarea, 0, 0, pPalmMisc->scrn_width, pPalmMisc->scrn_height);
 	pPalmMisc->half_scrn_area_size = AREA_SIZE(&tarea.extents);
-	pPalmMisc->half_scrn_area_size = (unsigned int)((double)pPalmMisc->half_scrn_area_size / 2);
+	pPalmMisc->half_scrn_area_size = (unsigned int)((double)pPalmMisc->half_scrn_area_size / 2.4f);
 #ifdef __HOLD_DETECTOR_DEBUG__
 	XDBG_DEBUG(MGEST, "pPalmMisc->half_scrn_area_size = %d\n", pPalmMisc->half_scrn_area_size);
 #endif//__HOLD_DETECTOR_DEBUG__
@@ -3734,6 +3471,7 @@ GesturePalmGetAbsAxisInfo(DeviceIntPtr dev)
 	Atom atom_mt_slot;
 	Atom atom_tracking_id;
 	Atom atom_distance;
+	Atom atom_mt_tool;
 
 	g_pGesture->wmajor_idx = -1;
 	g_pGesture->tmajor_idx = -1;
@@ -3742,6 +3480,7 @@ GesturePalmGetAbsAxisInfo(DeviceIntPtr dev)
 	g_pGesture->tpalm_idx = -1;
 	g_pGesture->mt_px_idx = -1;
 	g_pGesture->mt_py_idx = -1;
+	g_pGesture->mt_tool_idx = -1;
 
 	memset(&g_pGesture->palm, 0, sizeof(PalmStatus));
 
@@ -3762,11 +3501,16 @@ GesturePalmGetAbsAxisInfo(DeviceIntPtr dev)
 	atom_mt_slot = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_MT_SLOT);
 	atom_tracking_id = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_MT_TRACKING_ID);
 	atom_distance = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_MT_DISTANCE);
+	atom_mt_tool = XIGetKnownProperty(AXIS_LABEL_PROP_ABS_MT_TOOL_TYPE);
 
 	if (!numAxes || !atom_mt_px || !atom_mt_py || !atom_tmajor || !atom_tminor  || !atom_tangle || !atom_tpalm)
 	{
 		XDBG_WARNING(MGEST, "one or more axes is/are not supported!\n");
 		goto out;
+	}
+	if (!atom_mt_tool)
+	{
+		XDBG_WARNING(MGEST, "multitouch various type was not supported\n");
 	}
 
 	for( i = 0 ; i < numAxes ; i++ )
@@ -3811,12 +3555,21 @@ GesturePalmGetAbsAxisInfo(DeviceIntPtr dev)
 			g_pGesture->tpalm_idx = i;
 			found += 7;
 		}
+		else if ( atom_mt_tool && axes->label == atom_mt_tool )
+		{
+			g_pGesture->mt_tool_idx = i;
+			found += 8;
+		}
 	}
 
-	if (found != 28)
+	if (found != 36)
 	{
-		XDBG_WARNING(MGEST, "Axes for palm recognization are not supported !\n");
-		goto out;
+		XDBG_WARNING(MGEST, "Various multitouch devices are not supported !\n");
+		if (found != 28)
+		{
+			XDBG_WARNING(MGEST, "Axes for palm recognization are not supported !\n");
+			goto out;
+		}
 	}
 
 	pPalm = &g_pGesture->palm;
@@ -4140,18 +3893,12 @@ GesturePalmRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 	int idx = -1;
 	PalmStatusPtr pPalm = &g_pGesture->palm;
 	static int calc_touched = 0;
+	static int event_sum_palm_first_finger = 0, event_sum_palm_second_finger=0;
 
 	if( device->id < g_pGesture->first_fingerid )
 		return;
 
-	for( i = 0 ; i < g_pGesture->num_mt_devices ; i++ )
-	{
-		if( device->id == g_pGesture->mt_devices[i]->id )
-		{
-			idx = i;
-			break;
-		}
-	}
+	idx = GestureGetFingerIndexFromDevice(device);
 	if( idx < 0 )
 		return;
 
@@ -4161,22 +3908,39 @@ GesturePalmRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 	if(!g_pGesture->pTempPalmWin)
 	{
 		g_pGesture->pTempPalmWin = GestureGetEventsWindow();
-		if(!g_pGesture->pTempPalmWin)
+		if(!g_pGesture->pTempPalmWin || g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL)
 		{
 #ifdef __PALM_DETAIL_LOG__
 			XDBG_DEBUG(MGEST, "No events are grabbed/selected !\n");
 #endif//__PALM_DETAIL_LOG__
-			g_pGesture->palm_filter_mask = GESTURE_PALM_FILTER_MASK_ALL;
-			goto flush_or_drop;
+			g_pGesture->no_palm_events = TRUE;
+			if (g_pGesture->palm_rejection_mode == 0)
+			{
+				g_pGesture->palm_filter_mask = GESTURE_PALM_FILTER_MASK_ALL;
+				goto flush_or_drop;
+			}
+			else
+			{
+				g_pGesture->palm_filter_mask = 0;
+			}
 		}
 	}
 	GesturePalmDataUpdate(idx, type, ev, device);
 	GesturePalmUpdateAreaInfo(type, idx);
-
+#ifdef __PALM_DETAIL_LOG__
+	XDBG_DEBUG(MGEST, "[idx: %d: %d](%d, %d)max_tmajor: %lf, palmflag: %d, max_wmajor: %lf\n", idx, type, pPalm->pti[idx].x, pPalm->pti[idx].y, pPalm->max_tmajor, pPalm->palmflag, pPalm->max_wmajor);
+	XDBG_DEBUG(MGEST, "bigger_wmajor: %lf, biggest_tmajor: %lf, biggest_wmajor: %lf\n", pPalm->bigger_wmajor, pPalm->biggest_tmajor, pPalm->biggest_wmajor);
+	XDBG_DEBUG(MGEST, "area: %d, deviationX: %lf, deviationY: %lf, dispersionX: %lf, dispersion: %lf\n", pPalm->area, pPalm->deviationX, pPalm->deviationY, pPalm->dispersionX, pPalm->dispersionY);
+#endif
 	switch(type)
 	{
 		case ET_ButtonPress:
+			if( idx == 0 )
+				event_sum_palm_first_finger = BTN_PRESSED;
+			else if( idx == 1)
+				event_sum_palm_second_finger = BTN_PRESSED;
 			pPalm->max_touched++;
+
 			if( g_pGesture->num_pressed == 1 )
 			{
 				pPalm->palm_single_finger_timer = TimerSet(pPalm->palm_single_finger_timer, 0, 50, GesturePalmSingleFingerTimerHandler, NULL);
@@ -4187,9 +3951,83 @@ GesturePalmRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 			}
 			break;
 		case ET_Motion:
-			if(pPalm->cur_touched == 0)
+			if(pPalm->cur_touched == 0 || pPalm->pti[idx].touch_status != 1)
 			{
-				break;
+				return;
+			}
+			if((pPalm->cur_touched == 1 && idx == 0 && event_sum_palm_first_finger == BTN_PRESSED) ||
+				(pPalm->cur_touched == 2 && idx == 1 && event_sum_palm_second_finger == BTN_PRESSED))
+			{
+				if(idx == 0)
+				{
+					event_sum_palm_first_finger = BTN_MOVING;
+#ifdef __PALM_DETAIL_LOG__
+					XDBG_DEBUG(MGEST, "First move detected!\n");
+#endif//__PALM_DETAIL_LOG__
+				}
+				else // idx == 1
+				{
+					event_sum_palm_second_finger = BTN_MOVING;
+#ifdef __PALM_DETAIL_LOG__
+					XDBG_DEBUG(MGEST, "Second finger First move detected!\n");
+#endif//__PALM_DETAIL_LOG__
+				}
+				if (pPalm->palmflag < 1 && pPalm->biggest_tmajor < g_pGesture->palm_min_touch_major && pPalm->biggest_wmajor < g_pGesture->palm_min_width_major)
+				{
+#ifdef __PALM_DETAIL_LOG__
+					XDBG_DEBUG(MGEST, "No palm coming.\n");
+#endif//__PALM_DETAIL_LOG__
+					Bool exist;
+					exist = GestureIsPalmEventInMIEQ();
+#ifdef __PALM_DETAIL_LOG__
+					XDBG_DEBUG(MGEST, "palm event exist: %d\n", exist);
+#endif//__PALM_DETAIL_LOG__
+
+					if (exist)
+					{
+						pPalm->palmflag = 1;
+						g_pGesture->palm_detected = TRUE;
+					}
+					else
+					{
+						/*
+						 * The following is the bezel condition for palm
+						 * -- palm touch area can be smaller than that of non-bezel regions, so the threshold value is reduced.
+						 */
+						if(!(g_pGesture->palm_filter_mask & PalmFlickHorizFilterMask) &&
+							(pPalm->cx >= g_pGesture->screen_width - g_pGesture->palm_bezel || pPalm->cx < g_pGesture->palm_bezel) &&
+							(pPalm->biggest_tmajor >= g_pGesture->palm_min_touch_major_bezel || pPalm->biggest_wmajor >= g_pGesture->palm_min_width_major_bezel))
+						{
+							g_pGesture->palm_detected = TRUE;
+							break;
+						}
+						if(!(g_pGesture->palm_filter_mask & PalmFlickVertiFilterMask) &&
+							(pPalm->cy >= g_pGesture->screen_height - g_pGesture->palm_bezel || pPalm->cy < g_pGesture->palm_bezel) &&
+							(pPalm->biggest_tmajor >= g_pGesture->palm_min_touch_major_bezel || pPalm->biggest_wmajor >= g_pGesture->palm_min_width_major_bezel))
+						{
+							g_pGesture->palm_detected = TRUE;
+							break;
+						}
+
+						if (g_pGesture->palm_rejection_mode == 1 && g_pGesture->no_palm_events == TRUE)
+							g_pGesture->palm_filter_mask = GESTURE_PALM_FILTER_MASK_ALL;
+						g_pGesture->recognized_palm = 0;
+						if(!(g_pGesture->palm_filter_mask & PalmFlickHorizFilterMask))
+						{
+							GesturePalmRecognize_FlickHorizen(type, -1);
+						}
+						if(!(g_pGesture->palm_filter_mask & PalmFlickVertiFilterMask))
+						{
+							GesturePalmRecognize_FlickVertical(type, -1);
+						}
+						if (g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL)
+							goto flush_or_drop;
+					}
+				}
+				else
+				{
+					g_pGesture->palm_detected = TRUE;
+				}
 			}
 			calc_touched++;
 			if(calc_touched == pPalm->cur_touched)
@@ -4198,11 +4036,21 @@ GesturePalmRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 			}
 			break;
 		case ET_ButtonRelease:
+			if( idx == 0 )
+				event_sum_palm_first_finger = BTN_RELEASED;
+			else if( idx == 1)
+				event_sum_palm_second_finger = BTN_RELEASED;
 			if(calc_touched)
 			{
 				calc_touched--;
 			}
 			break;
+	}
+	if( g_pGesture->palm_rejection_mode == 1 && g_pGesture->palm_detected == TRUE && g_pGesture->no_palm_events == TRUE)
+	{
+		g_pGesture->recognized_palm = 0;
+		g_pGesture->palm_filter_mask = GESTURE_PALM_FILTER_MASK_ALL;
+		goto flush_or_drop;
 	}
 
 	if( GestureHasFingerEventMask(GestureNotifyFlick, 0) )
@@ -4214,13 +4062,6 @@ GesturePalmRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 		if(!(g_pGesture->palm_filter_mask & PalmFlickVertiFilterMask))
 		{
 			GesturePalmRecognize_FlickVertical(type, idx);
-		}
-	}
-	if( GestureHasFingerEventMask(GestureNotifyHold, 0) )
-	{
-		if(!(g_pGesture->palm_filter_mask & PalmHoldFilterMask))
-		{
-			GesturePalmRecognize_Hold(type, idx, 0);
 		}
 	}
 
@@ -4485,6 +4326,188 @@ bezel_cleanup:
 }
 #endif
 
+static EventQueuePtr
+GestureGetMIEQ(void)
+{
+	if (*checkForInput[0] == *checkForInput[1])
+	{
+#ifdef __DETAIL_DEBUG__
+		XDBG_DEBUG(MGEST, "mieq is empty !\n");
+#endif//__DETAIL_DEBUG__
+		return NULL;
+	}
+
+	EventQueuePtr mieqEQPtr = NULL;
+	mieqEQPtr = mieqGetEventQueuePtr();
+
+	if (!mieqEQPtr)
+	{
+#ifdef __DETAIL_DEBUG__
+		XDBG_DEBUG(MGEST, "mieqEQPtr is NULL !\n");
+#endif//__DETAIL_DEBUG__
+
+		return NULL;
+	}
+
+	int num = mieqNumEnqueued(mieqEQPtr);
+#ifdef __DETAIL_DEBUG__
+	XDBG_DEBUG(MGEST, " num of event in mieq = %d\n", num);
+#endif//__DETAIL_DEBUG__
+	if (num <= 0)
+		return NULL;
+
+	return mieqEQPtr;
+}
+
+static Bool
+GestureIsEventInMIEQ(int finger_index, enum EventType type)
+{
+	EventQueuePtr mieqEQPtr = NULL;
+	mieqEQPtr = GestureGetMIEQ();
+	if (!mieqEQPtr)
+	{
+#ifdef __DETAIL_DEBUG__
+		XDBG_DEBUG(MGEST, "failed to get mieq\n");
+#endif//__DETAIL_DEBUG__
+		return FALSE;
+	}
+
+	int deviceid = GestureGetDeviceIdFromFingerIndex(finger_index);
+	if (deviceid < 0)
+	{
+		XDBG_ERROR(MGEST, "Failed to get deviceid from finger index !\n");
+		return FALSE;
+	}
+
+	EventRec *e = NULL;
+	static InternalEvent event;
+	HWEventQueueType head, tail;
+	head = mieqEQPtr->head;
+	tail = mieqEQPtr->tail;
+
+	while (head != tail)
+	{
+		e = &mieqEQPtr->events[head];
+		if (e)
+		{
+			event = *e->events;
+
+			if (e->pDev && (deviceid == e->pDev->id) && (event.any.type == type))
+			{
+				return TRUE;
+			}
+		}
+
+		head = (head + 1) % mieqEQPtr->nevents;
+	}
+
+	return FALSE;
+}
+
+static Bool
+GestureIsPalmEventInMIEQ(void)
+{
+	EventQueuePtr mieqEQPtr = NULL;
+	mieqEQPtr = GestureGetMIEQ();
+	if (!mieqEQPtr)
+	{
+#ifdef __PALM_DETAIL_LOG__
+		XDBG_DEBUG(MGEST, "failed to get mieq\n");
+#endif//__PALM_DETAIL_LOG__
+		return FALSE;
+	}
+
+	EventRec *e = NULL;
+	static InternalEvent event;
+	HWEventQueueType head, tail;
+	head = mieqEQPtr->head;
+	tail = mieqEQPtr->tail;
+
+	while (head != tail)
+	{
+		e = &mieqEQPtr->events[head];
+		if (e)
+		{
+			event = *e->events;
+
+			if (GestureIsPalmEvent(&event))
+			{
+				return TRUE;
+			}
+		}
+
+		head = (head + 1) % mieqEQPtr->nevents;
+	}
+
+	return FALSE;
+}
+
+static Bool
+GestureIsPalmEvent(InternalEvent *event)
+{
+	int wmajor_idx = g_pGesture->wmajor_idx;
+	int tmajor_idx = g_pGesture->tmajor_idx;
+	int tpalm_idx = g_pGesture->tpalm_idx;
+
+	double width_major = 0.0f;
+	double touch_major = 0.0f;
+	double touch_palm = 0.0f;
+
+	if (event->any.type != ET_ButtonPress && event->any.type != ET_Motion && event->any.type != ET_ButtonRelease)
+		return FALSE;
+
+	DeviceEvent *de = &event->device_event;
+
+	if (!de || !de->valuators.data)
+	{
+		XDBG_WARNING(MGEST, "de or de->valuators.data are NULL !\n");
+		return FALSE;
+	}
+
+	if ((wmajor_idx < 0) || (tmajor_idx < 0) || (tpalm_idx < 0))
+	{
+		XDBG_WARNING(MGEST, "One or more of axes are not supported !\n");
+		return FALSE;
+	}
+
+	width_major = de->valuators.data[wmajor_idx];
+	touch_major = de->valuators.data[tmajor_idx];
+	touch_palm = de->valuators.data[tpalm_idx];
+#ifdef __PALM_DETAIL_LOG__
+	XDBG_DEBUG(MGEST, "width_major: %.f, touch_major: %.f, touch_palm: %.f\n", width_major, touch_major, touch_palm);
+#endif//__PALM_DETAIL_LOG__
+
+	if (touch_palm >= 1 || touch_major >= g_pGesture->palm_min_touch_major || width_major >= g_pGesture->palm_min_width_major)
+		return TRUE;
+	return FALSE;
+}
+
+static int
+GestureGetFingerIndexFromDevice(DeviceIntPtr device)
+{
+	int i;
+
+	for( i = 0 ; i < g_pGesture->num_mt_devices ; i++ )
+	{
+		if( device->id == g_pGesture->mt_devices[i]->id )
+		{
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+static int
+GestureGetDeviceIdFromFingerIndex(int finger_index)
+{
+	if (g_pGesture->num_mt_devices <= finger_index)
+		return -1;
+
+	return g_pGesture->mt_devices[finger_index]->id;
+}
+
+
 void
 GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 {
@@ -4496,14 +4519,7 @@ GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 		device->id < g_pGesture->first_fingerid )
 		return;
 
-	for( i = 0 ; i < g_pGesture->num_mt_devices ; i++ )
-	{
-		if( device->id == g_pGesture->mt_devices[i]->id )
-		{
-			idx = i;
-			break;
-		}
-	}
+	idx = GestureGetFingerIndexFromDevice(device);
 
 	if( idx < 0 )
 		return;
@@ -4531,7 +4547,7 @@ GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 
 			if( g_pGesture->num_pressed == 1 )
 			{
-				single_finger_timer = TimerSet(single_finger_timer, 0, g_pGesture->singlefinger_threshold, GestureSingleFingerTimerHandler, NULL);
+				single_finger_timer = TimerSet(single_finger_timer, 0, g_pGesture->tap_repeated ? 80 : g_pGesture->singlefinger_threshold, GestureSingleFingerTimerHandler, NULL);
 			}
 			else
 			{
@@ -4545,7 +4561,7 @@ GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 			{
 				g_pGesture->pTempWin = GestureGetEventsWindow();
 
-				if( NULL == g_pGesture->pTempWin )
+				if( NULL == g_pGesture->pTempWin || g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL)
 				{
 #ifdef __DETAIL_DEBUG__
 					XDBG_DEBUG(MGEST, "[g_pGesture->num_pressed=%d] No events were selected !\n", g_pGesture->num_pressed);
@@ -4562,82 +4578,96 @@ GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 			g_pGesture->finger_rects[idx].extents.y1 =  ev->device_event.root_y - FINGER_HEIGHT;
 			g_pGesture->finger_rects[idx].extents.y2 =  ev->device_event.root_y + FINGER_HEIGHT;
 
-			if( g_pGesture->inc_num_pressed == 1 )
+			pixman_region_union(&g_pGesture->area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[0]);
+			for( i = 1 ; i < g_pGesture->inc_num_pressed ; i++ )
 			{
-				pixman_region_union(&g_pGesture->area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[0]);
-#ifdef __DETAIL_DEBUG__
-				XDBG_DEBUG(MGEST, "[P][g_pGesture->inc_num_pressed=1] AREA_SIZE(area.extents)=%d\n", AREA_SIZE(&g_pGesture->area.extents));
-#endif//__DETAIL_DEBUG__
+				pixman_region_union(&g_pGesture->area, &g_pGesture->area, &g_pGesture->finger_rects[i]);
 			}
-			else
-			{
-				pixman_region_union(&g_pGesture->area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[0]);
-				for( i = 1 ; i < g_pGesture->inc_num_pressed ; i++ )
-				{
-					pixman_region_union(&g_pGesture->area, &g_pGesture->area, &g_pGesture->finger_rects[i]);
-				}
 #ifdef __DETAIL_DEBUG__
-				XDBG_DEBUG(MGEST, "[P][g_pGesture->inc_num_pressed=%d] AREA_SIZE(area.extents)=%d\n", g_pGesture->inc_num_pressed, AREA_SIZE(&g_pGesture->area.extents));
+			XDBG_DEBUG(MGEST, "[M][g_pGesture->inc_num_pressed=%d] AREA_SIZE(area)=%d\n", g_pGesture->inc_num_pressed, AREA_SIZE(&g_pGesture->area.extents));
 #endif//__DETAIL_DEBUG__
-			}
 
 			break;
 
 		case ET_Motion:
 			if( !g_pGesture->fingers[idx].ptime )
 				return;
+
+			g_pGesture->fingers[idx].mx = ev->device_event.root_x;
+			g_pGesture->fingers[idx].my = ev->device_event.root_y;
+
 			if( (g_pGesture->inc_num_pressed < 2) && (idx == 0))
 			{
 				g_pGesture->event_sum[0] += BTN_MOVING;
 #ifdef __DETAIL_DEBUG__
 				XDBG_DEBUG(MGEST, "no seconds finger comming\n");
 #endif//__DETAIL_DEBUG__
-
-				// tolerate false motion events only when second double-finger press is applied
 				if(!g_pGesture->tap_repeated)
 				{
+					if(g_pGesture->event_sum[0] >= 3)
+					{
 #ifdef __DETAIL_DEBUG__
-					XDBG_DEBUG(MGEST, "single finger!\n");
+						XDBG_DEBUG(MGEST, "single finger!\n");
 #endif//__DETAIL_DEBUG__
-					g_pGesture->filter_mask = GESTURE_FILTER_MASK_ALL;
-					goto flush_or_drop;
+						Bool exist;
+						exist = GestureIsEventInMIEQ(1, ET_ButtonPress);
+#ifdef __DETAIL_DEBUG__
+						XDBG_DEBUG(MGEST, "two finger touch in queue, exist: %d\n", exist);
+#endif//__DETAIL_DEBUG__
+						if (exist)
+							g_pGesture->event_sum[0] -= BTN_MOVING;
+						else
+						{
+							g_pGesture->filter_mask = GESTURE_FILTER_MASK_ALL;
+							goto flush_or_drop;
+						}
+					}
 				}
-				else if(g_pGesture->event_sum[0] >= 7)
+				else
 				{
+					if(ABS(g_pGesture->fingers[idx].mx - g_pGesture->fingers[idx].px) > FINGER_WIDTH
+					|| ABS(g_pGesture->fingers[idx].my - g_pGesture->fingers[idx].py) > FINGER_HEIGHT)
+					{
 #ifdef __DETAIL_DEBUG__
-					XDBG_DEBUG(MGEST, "tap repeat Moving Limit Exceeded.\n");
+						XDBG_DEBUG(MGEST, "tap repeat Moving Limit Exceeded.\n");
 #endif//__DETAIL_DEBUG__
-					g_pGesture->filter_mask = GESTURE_FILTER_MASK_ALL;
-					goto flush_or_drop;
+						g_pGesture->filter_mask = GESTURE_FILTER_MASK_ALL;
+						goto flush_or_drop;
+					}
+					else if(g_pGesture->event_sum[0] >= 15)
+					{
+#ifdef __DETAIL_DEBUG__
+						XDBG_DEBUG(MGEST, "tap repeat Moving Limit Exceeded.\n");
+#endif//__DETAIL_DEBUG__
+						Bool exist;
+						exist = GestureIsEventInMIEQ(1, ET_ButtonPress);
+#ifdef __DETAIL_DEBUG__
+						XDBG_DEBUG(MGEST, "two finger touch in queue, exist: %d\n", exist);
+#endif//__DETAIL_DEBUG__
+						if (exist)
+							g_pGesture->event_sum[0] -= BTN_MOVING;
+						else
+						{
+							g_pGesture->filter_mask = GESTURE_FILTER_MASK_ALL;
+							goto flush_or_drop;
+						}
+					}
 				}
 			}
-
-			g_pGesture->fingers[idx].mx = ev->device_event.root_x;
-			g_pGesture->fingers[idx].my = ev->device_event.root_y;
 
 			g_pGesture->finger_rects[idx].extents.x1 = ev->device_event.root_x - FINGER_WIDTH;
 			g_pGesture->finger_rects[idx].extents.x2 = ev->device_event.root_x + FINGER_WIDTH;
 			g_pGesture->finger_rects[idx].extents.y1 =  ev->device_event.root_y - FINGER_HEIGHT;
 			g_pGesture->finger_rects[idx].extents.y2 =  ev->device_event.root_y + FINGER_HEIGHT;
 
-			if( g_pGesture->inc_num_pressed == 1 )
+			pixman_region_union(&g_pGesture->area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[0]);
+			for( i = 1 ; i < g_pGesture->inc_num_pressed ; i++ )
 			{
-				pixman_region_union(&g_pGesture->area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[0]);
-#ifdef __DETAIL_DEBUG__
-				XDBG_DEBUG(MGEST, "[M][g_pGesture->inc_num_pressed=1] AREA_SIZE(area)=%d\n", AREA_SIZE(&g_pGesture->area.extents));
-#endif//__DETAIL_DEBUG__
+				pixman_region_union(&g_pGesture->area, &g_pGesture->area, &g_pGesture->finger_rects[i]);
 			}
-			else
-			{
-				pixman_region_union(&g_pGesture->area, &g_pGesture->finger_rects[0], &g_pGesture->finger_rects[0]);
-				for( i = 1 ; i < g_pGesture->inc_num_pressed ; i++ )
-				{
-					pixman_region_union(&g_pGesture->area, &g_pGesture->area, &g_pGesture->finger_rects[i]);
-				}
 #ifdef __DETAIL_DEBUG__
-				XDBG_DEBUG(MGEST, "[M][g_pGesture->inc_num_pressed=%d] AREA_SIZE(area)=%d\n", g_pGesture->inc_num_pressed, AREA_SIZE(&g_pGesture->area.extents));
+			XDBG_DEBUG(MGEST, "[M][g_pGesture->inc_num_pressed=%d] AREA_SIZE(area)=%d\n", g_pGesture->inc_num_pressed, AREA_SIZE(&g_pGesture->area.extents));
 #endif//__DETAIL_DEBUG__
-			}
 			break;
 
 		case ET_ButtonRelease:
@@ -4712,7 +4742,7 @@ GestureRecognize(int type, InternalEvent *ev, DeviceIntPtr device)
 	return;
 
 flush_or_drop:
-
+	TimerCancel(single_finger_timer);
 #ifdef __DETAIL_DEBUG__
 	XDBG_DEBUG(MGEST, "GestureFlushOrDrop() !\n");
 #endif//__DETAIL_DEBUG__
@@ -4768,10 +4798,16 @@ ErrorStatus GestureFlushOrDrop(void)
 #endif
 	{
 		g_pGesture->ehtype = PROPAGATE_EVENTS;
-		err = GestureEventsFlush();
-		if( ERROR_NONE != err )
-			return err;
-
+		if (g_pGesture->palm_rejection_mode == 1 && g_pGesture->palm_detected == TRUE)
+		{
+			GestureEventsDrop();
+		}
+		else
+		{
+			err = GestureEventsFlush();
+			if( ERROR_NONE != err )
+				return err;
+		}
 		err = GestureRegionsReinit();
 		for(i=0; i<MAX_MT_DEVICES; i++)
 		{
@@ -4837,6 +4873,11 @@ GestureHandleMTSyncEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 			for( i=0 ; i < g_pGesture->num_mt_devices ; i++ )
 				g_pGesture->fingers[i].ptime = 0;
 		}
+		g_pGesture->stylusInfo.stylus_id = 0;
+		g_pGesture->stylusInfo.pen_detected = FALSE;
+		g_pGesture->no_palm_events = FALSE;
+		g_pGesture->stylusInfo.fake_events = FALSE;
+		g_pGesture->palm_detected = FALSE;
 	}
 	else if( MTOUCH_FRAME_SYNC_END == ev->any_event.sync )
 	{
@@ -4859,20 +4900,239 @@ GestureHandleMTSyncEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 			g_pGesture->inc_num_pressed = g_pGesture->num_pressed = 0;
 			g_pGesture->event_sum[0] = 0;
 			pPalm->max_touched = 0;
+			g_pGesture->hold_detected = FALSE;
 #ifdef _F_SUPPORT_BEZEL_FLICK_
 			pBezel->is_active = BEZEL_END;
 			g_pGesture->bezel_filter_mask = BezelFlickFilterMask;
 #endif
 		}
+		for(i=0; i<MAX_MT_DEVICES; i++)
+		{
+			g_pGesture->stylusInfo.t_status[i].status = BTN_RELEASED;
+		}
 	}
+}
+
+static int
+GestureGetMTToolValuator(InternalEvent *ev, DeviceIntPtr device)
+{
+	int mt_tool_idx = g_pGesture->mt_tool_idx;
+	double mt_tool = 0.0f;
+
+	DeviceEvent *de = &ev->device_event;
+
+	if (!de || !de->valuators.data)
+	{
+		XDBG_WARNING(MGEST, "de or de->valuators.data are NULL !\n");
+		return -1;
+	}
+
+	if (mt_tool_idx < 0)
+	{
+		XDBG_WARNING(MGEST, "One or more of axes are not supported !\n");
+		return -1;
+	}
+
+	if (ev->any.type == ET_ButtonPress || ev->any.type == ET_ButtonRelease)
+	{
+		if (device->id == g_pGesture->master_pointer->id && g_pGesture->stylusInfo.stylus_id == g_pGesture->first_fingerid)
+			de->valuators.data[mt_tool_idx] = 1;
+
+		if (g_pGesture->stylusInfo.stylus_id == device->id)
+			de->valuators.data[mt_tool_idx] = 1;
+	}
+
+	mt_tool = de->valuators.data[mt_tool_idx];
+
+	return (int)mt_tool;
+}
+
+static void
+GestureRegisterTouchInfo(InternalEvent *ev, DeviceIntPtr device)
+{
+	int idx;
+
+	idx = GestureGetFingerIndexFromDevice(device);
+	if (idx < 0)
+	{
+		if (device->id != g_pGesture->master_pointer->id)
+			XDBG_WARNING(MGEST, "Failed to get correct idx(%d) device->id: %d, master_pointer: %d\n", idx, device->id, g_pGesture->master_pointer->id);
+		return;
+	}
+	switch(ev->any.type)
+	{
+		case ET_ButtonPress:
+			g_pGesture->stylusInfo.t_status[idx].status = BTN_PRESSED;
+			break;
+		case ET_Motion:
+			if (g_pGesture->stylusInfo.t_status[idx].status == BTN_PRESSED)
+				g_pGesture->stylusInfo.t_status[idx].status = BTN_MOVING;
+			break;
+		case ET_ButtonRelease:
+			g_pGesture->stylusInfo.t_status[idx].status = BTN_RELEASED;
+			break;
+		default:
+			XDBG_WARNING(MGEST, "unhandled event type(%d)\n", ev->any.type);
+			break;
+	}
+	g_pGesture->stylusInfo.t_status[idx].cx = ev->device_event.root_x;
+	g_pGesture->stylusInfo.t_status[idx].cy = ev->device_event.root_y;
+}
+
+static void
+GestureSetToolData(InternalEvent *ev, double val_tool)
+{
+	int mt_tool_idx = g_pGesture->mt_tool_idx;
+	double mt_tool = 0.0f;
+
+	DeviceEvent *de = &ev->device_event;
+
+	if (!de || !de->valuators.data)
+	{
+		XDBG_WARNING(MGEST, "de or de->valuators.data are NULL !\n");
+		return;
+	}
+
+	if (mt_tool_idx < 0)
+	{
+		XDBG_WARNING(MGEST, "One or more of axes are not supported !\n");
+		return;
+	}
+	de->valuators.data[mt_tool_idx] = val_tool;
+}
+
+static void
+GestureCleanupTouch(int screen_num, InternalEvent *ev, DeviceIntPtr device)
+{
+	ErrorStatus err;
+	int i;
+	if (g_pGesture->stylusInfo.stylus_id == 0 && g_pGesture->stylusInfo.pen_detected == FALSE)
+		g_pGesture->stylusInfo.stylus_id = device->id;
+
+	if (g_pGesture->ehtype == KEEP_EVENTS)
+	{
+		GestureEventsDrop();
+		g_pGesture->ehtype = PROPAGATE_EVENTS;
+	}
+	else if (g_pGesture->stylusInfo.pen_detected == FALSE && g_pGesture->ehtype == PROPAGATE_EVENTS)
+	{
+		g_pGesture->stylusInfo.pen_detected = TRUE;
+		g_pGesture->stylusInfo.fake_events = TRUE;
+		for(i=0; i<MAX_MT_DEVICES; i++)
+		{
+			if (g_pGesture->stylusInfo.t_status[i].status == BTN_PRESSED || g_pGesture->stylusInfo.t_status[i].status == BTN_MOVING)
+			{
+				InternalEvent release_ev;
+				memcpy(&release_ev, ev, sizeof(InternalEvent));
+				release_ev.any.time = ev->any.time;
+				release_ev.any.type = ET_ButtonRelease;
+
+				release_ev.device_event.detail.button = 1;
+				release_ev.device_event.type = ET_ButtonRelease;
+				release_ev.device_event.root_x = g_pGesture->stylusInfo.t_status[i].cx;
+				release_ev.device_event.root_y = g_pGesture->stylusInfo.t_status[i].cy;
+				release_ev.device_event.deviceid = g_pGesture->mt_devices[i]->id;
+				g_pGesture->stylusInfo.t_status[i].status = BTN_RELEASED;
+				GestureSetToolData(&release_ev, (double)0);
+
+				GestureHandleButtonReleaseEvent(screen_num, &release_ev, g_pGesture->mt_devices[i]);
+				if (g_pGesture->mt_devices[i]->id == g_pGesture->first_fingerid)
+				{
+					InternalEvent release_mev;
+					memcpy(&release_mev, ev, sizeof(InternalEvent));
+					release_mev.any.time = ev->any.time;
+					release_mev.any.type = ET_ButtonRelease;
+
+					release_mev.device_event.detail.button = 1;
+					release_mev.device_event.type = ET_ButtonRelease;
+					release_mev.device_event.root_x = g_pGesture->stylusInfo.t_status[i].cx;
+					release_mev.device_event.root_y = g_pGesture->stylusInfo.t_status[i].cy;
+					release_mev.device_event.deviceid = g_pGesture->master_pointer->id;
+					GestureSetToolData(&release_mev, (double)0);
+
+					GestureHandleButtonReleaseEvent(screen_num, &release_mev, g_pGesture->master_pointer);
+				}
+			}
+		}
+		g_pGesture->stylusInfo.fake_events = FALSE;
+	}
+	g_pGesture->stylusInfo.pen_detected = TRUE;
+	g_pGesture->filter_mask = GESTURE_FILTER_MASK_ALL;
+	g_pGesture->recognized_gesture = 0;
+	g_pGesture->palm_filter_mask = GESTURE_PALM_FILTER_MASK_ALL;
+	g_pGesture->recognized_palm = 0;
+}
+
+static void
+GestureChangeEventToFirstFingerEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
+{
+	InternalEvent master_ev;
+	ev->device_event.deviceid = g_pGesture->first_fingerid;
+
+	switch(ev->any.type)
+	{
+		case ET_ButtonPress:
+			if(!(device->id < g_pGesture->first_fingerid))
+				g_pGesture->num_pressed++;
+			break;
+		case ET_ButtonRelease:
+			if(!(device->id < g_pGesture->first_fingerid))
+				g_pGesture->num_pressed--;
+			break;
+		default:
+			break;
+	}
+	memcpy(&master_ev, ev, sizeof(InternalEvent));
+	g_pGesture->mt_devices[0]->public.processInputProc(ev, g_pGesture->mt_devices[0]);
+
+	master_ev.device_event.deviceid = g_pGesture->master_pointer->id;
+	g_pGesture->master_pointer->public.processInputProc(&master_ev, g_pGesture->master_pointer);
 }
 
 void
 GestureHandleButtonPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 {
 #ifdef __DEBUG_EVENT_HANDLER__
-	XDBG_DEBUG(MGEST, "mode: %d devid=%d time:%d cur: %d\n", g_pGesture->ehtype, device->id, ev->any.time, GetTimeInMillis());
+	XDBG_DEBUG(MGEST, "mode: %d devid=%d time:%d cur: %d (%d, %d)\n",
+		g_pGesture->ehtype, device->id, ev->any.time, GetTimeInMillis(), ev->device_event.root_x, ev->device_event.root_y);
 #endif//__DEBUG_EVENT_HANDLER__
+
+	if (g_pGesture->stylus_able)
+	{
+		int isStylus = GestureGetMTToolValuator(ev, device);
+
+#ifdef __DEBUG_EVENT_HANDLER__
+			XDBG_DEBUG(MGEST, "isSytlus: %d, pen_detected: %d, stylus_id: %d\n", isStylus, g_pGesture->stylusInfo.pen_detected, g_pGesture->stylusInfo.stylus_id);
+#endif//__DEBUG_EVENT_HANDLER__
+
+		if (g_pGesture->stylusInfo.pen_detected == FALSE)
+		{
+			if (!isStylus)
+			{
+				GestureRegisterTouchInfo(ev, device);
+			}
+			else
+			{
+				GestureCleanupTouch(screen_num, ev, device);
+			}
+		}
+		if (g_pGesture->stylusInfo.pen_detected == TRUE)
+		{
+			if (!isStylus || (device->id != g_pGesture->stylusInfo.stylus_id ))
+			{
+				if (!(g_pGesture->stylusInfo.stylus_id == g_pGesture->first_fingerid && device->id == g_pGesture->master_pointer->id))
+				{
+					return;
+				}
+			}
+			else if (device->id != g_pGesture->first_fingerid)
+			{
+				GestureChangeEventToFirstFingerEvent(screen_num, ev, device);
+				return;
+			}
+		}
+	}
+
 	switch( g_pGesture->ehtype )
 	{
 		case KEEP_EVENTS:
@@ -4892,7 +5152,12 @@ GestureHandleButtonPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr de
 				if(!(g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL))
 					GestureRecognize(ET_ButtonPress, ev, device);
 				if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
-					GesturePalmRecognize(ET_ButtonPress, ev, device);
+				{
+					if (PalmRecognize)
+						_GESTUREPALMRECOGNIZE_(PalmRecognize, ET_ButtonPress, ev, device)
+					else
+						g_pGesture->ehtype = PROPAGATE_EVENTS;
+				}
 			}
 			else
 				device->public.processInputProc(ev, device);
@@ -4902,7 +5167,14 @@ GestureHandleButtonPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr de
 		case PROPAGATE_EVENTS:
 			if(!(device->id < g_pGesture->first_fingerid))
 				g_pGesture->num_pressed++;
-			device->public.processInputProc(ev, device);
+			if (g_pGesture->palm_rejection_mode == 1 && g_pGesture->stylusInfo.pen_detected == TRUE)
+			{
+				device->public.processInputProc(ev, device);
+			}
+			else if (!(g_pGesture->palm_rejection_mode == 1 && g_pGesture->palm_detected == TRUE))
+			{
+				device->public.processInputProc(ev, device);
+			}
 			GestureHoldDetector(ET_ButtonPress, ev, device);
 			break;
 
@@ -4916,7 +5188,10 @@ GestureHandleButtonPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr de
 			if(!(g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL))
 				GestureRecognize(ET_ButtonPress, ev, device);
 			if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
-				GesturePalmRecognize(ET_ButtonPress, ev, device);
+			{
+				if (PalmRecognize)
+					_GESTUREPALMRECOGNIZE_(PalmRecognize, ET_ButtonPress, ev, device);
+			}
 			break;
 
 		default:
@@ -4928,8 +5203,45 @@ void
 GestureHandleMotionEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 {
 #ifdef __DEBUG_EVENT_HANDLER__
-	XDBG_DEBUG(MGEST, "devid=%d time:%d cur: %d\n", device->id, ev->any.time, GetTimeInMillis());
+	XDBG_DEBUG(MGEST, "mode: %d devid=%d time:%d cur: %d (%d, %d)\n",
+		g_pGesture->ehtype, device->id, ev->any.time, GetTimeInMillis(), ev->device_event.root_x, ev->device_event.root_y);
 #endif//__DEBUG_EVENT_HANDLER__
+
+	if (g_pGesture->stylus_able)
+	{
+		int isStylus = GestureGetMTToolValuator(ev, device);
+
+#ifdef __DEBUG_EVENT_HANDLER__
+			XDBG_DEBUG(MGEST, "isSytlus: %d, pen_detected: %d, stylus_id: %d\n", isStylus, g_pGesture->stylusInfo.pen_detected, g_pGesture->stylusInfo.stylus_id);
+#endif//__DEBUG_EVENT_HANDLER__
+
+		if (g_pGesture->stylusInfo.pen_detected == FALSE)
+		{
+			if (!isStylus)
+			{
+				GestureRegisterTouchInfo(ev, device);
+			}
+			else
+			{
+				GestureCleanupTouch(screen_num, ev, device);
+			}
+		}
+		if (g_pGesture->stylusInfo.pen_detected == TRUE)
+		{
+			if (!isStylus || (device->id != g_pGesture->stylusInfo.stylus_id ))
+			{
+				if (!(g_pGesture->stylusInfo.stylus_id == g_pGesture->first_fingerid && device->id == g_pGesture->master_pointer->id))
+				{
+					return;
+				}
+			}
+			else if (device->id != g_pGesture->first_fingerid)
+			{
+				GestureChangeEventToFirstFingerEvent(screen_num, ev, device);
+				return;
+			}
+		}
+	}
 
 	switch( g_pGesture->ehtype )
 	{
@@ -4948,7 +5260,12 @@ GestureHandleMotionEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 				if(!(g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL))
 					GestureRecognize(ET_Motion, ev, device);
 				if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
-					GesturePalmRecognize(ET_Motion, ev, device);
+				{
+					if (PalmRecognize)
+						_GESTUREPALMRECOGNIZE_(PalmRecognize, ET_Motion, ev, device)
+					else
+						g_pGesture->ehtype = PROPAGATE_EVENTS;
+				}
 			}
 			else
 				device->public.processInputProc(ev, device);
@@ -4956,7 +5273,14 @@ GestureHandleMotionEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 			break;
 
 		case PROPAGATE_EVENTS:
-			device->public.processInputProc(ev, device);
+			if (g_pGesture->palm_rejection_mode == 1 && g_pGesture->stylusInfo.pen_detected == TRUE)
+			{
+				device->public.processInputProc(ev, device);
+			}
+			else if (!(g_pGesture->palm_rejection_mode == 1 && g_pGesture->palm_detected == TRUE))
+			{
+				device->public.processInputProc(ev, device);
+			}
 			GestureHoldDetector(ET_Motion, ev, device);
 			break;
 
@@ -4968,7 +5292,10 @@ GestureHandleMotionEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 			if(!(g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL))
 				GestureRecognize(ET_Motion, ev, device);
 			if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
-				GesturePalmRecognize(ET_Motion, ev, device);
+			{
+				if (PalmRecognize)
+					_GESTUREPALMRECOGNIZE_(PalmRecognize, ET_Motion, ev, device);
+			}
 			break;
 
 		default:
@@ -4981,8 +5308,50 @@ void
 GestureHandleButtonReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 {
 #ifdef __DEBUG_EVENT_HANDLER__
-	XDBG_DEBUG(MGEST, "devid=%d time:%d cur: %d\n", device->id, ev->any.time, GetTimeInMillis());
+	XDBG_DEBUG(MGEST, "mode: %d devid=%d time:%d cur: %d (%d, %d)\n",
+		g_pGesture->ehtype, device->id, ev->any.time, GetTimeInMillis(), ev->device_event.root_x, ev->device_event.root_y);
 #endif//__DEBUG_EVENT_HANDLER__
+
+	if (g_pGesture->stylus_able)
+	{
+		int isStylus = GestureGetMTToolValuator(ev, device);
+
+#ifdef __DEBUG_EVENT_HANDLER__
+	XDBG_DEBUG(MGEST, "isSytlus: %d, pen_detected: %d, stylus_id: %d\n", isStylus, g_pGesture->stylusInfo.pen_detected, g_pGesture->stylusInfo.stylus_id);
+#endif//__DEBUG_EVENT_HANDLER__
+
+		if (g_pGesture->stylusInfo.pen_detected == FALSE)
+		{
+			if (!isStylus)
+			{
+				GestureRegisterTouchInfo(ev, device);
+			}
+			else
+			{
+				GestureCleanupTouch(screen_num, ev, device);
+			}
+		}
+		if (g_pGesture->stylusInfo.pen_detected == TRUE)
+		{
+			if (g_pGesture->stylusInfo.fake_events == TRUE)
+			{
+				goto deliver_event;
+			}
+			if (!isStylus || (device->id != g_pGesture->stylusInfo.stylus_id ))
+			{
+				if (!(g_pGesture->stylusInfo.stylus_id == g_pGesture->first_fingerid && device->id == g_pGesture->master_pointer->id))
+				{
+					return;
+				}
+			}
+			else if (device->id != g_pGesture->first_fingerid)
+			{
+				GestureChangeEventToFirstFingerEvent(screen_num, ev, device);
+				return;
+			}
+		}
+	}
+deliver_event:
 	switch( g_pGesture->ehtype )
 	{
 		case KEEP_EVENTS:
@@ -5002,7 +5371,12 @@ GestureHandleButtonReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr 
 				if(!(g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL))
 					GestureRecognize(ET_ButtonRelease, ev, device);
 				if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
-					GesturePalmRecognize(ET_ButtonRelease, ev, device);
+				{
+					if (PalmRecognize)
+						_GESTUREPALMRECOGNIZE_(PalmRecognize, ET_ButtonRelease, ev, device)
+					else
+						g_pGesture->num_mt_devices = PROPAGATE_EVENTS;
+				}
 			}
 			else
 				device->public.processInputProc(ev, device);
@@ -5010,9 +5384,45 @@ GestureHandleButtonReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr 
 			break;
 
 		case PROPAGATE_EVENTS:
+#ifdef SUPPORT_ANR_WITH_INPUT_EVENT
+                     if( IsMaster(device) && ev->any.type == ET_ButtonRelease )
+                     {
+                         if( g_pGesture->anr_window == NULL )
+                         {
+                             g_pGesture->anr_window = _GestureFindANRWindow(device);
+                         }
+                         Time current_time;
+
+                         // Send event to the e17 process.
+                         current_time = GetTimeInMillis();
+                         if( g_pGesture->anr_window != NULL )
+                         {
+                             // Check anr_window validation.
+                             if( dixLookupWindow(&g_pGesture->anr_window, prop_anr_event_window_xid, serverClient, DixSetPropAccess) != BadWindow )
+                             {
+                                 if( serverClient->devPrivates != NULL )
+                                     dixChangeWindowProperty (serverClient, g_pGesture->anr_window, prop_anr_in_input_event,
+                                                                               XA_CARDINAL, 32, PropModeReplace, 1, &current_time, TRUE);
+                             }
+                             else
+                             {
+                                 prop_anr_event_window_xid = 0;
+                                 g_pGesture->anr_window = NULL;
+                             }
+                             XDBG_DEBUG(MGEST, "Release TOUCH!!   devid=%d time:%d cur: %d\n", device->id, ev->any.time, GetTimeInMillis());
+                         }
+                     }
+#endif
 			if(!(device->id < g_pGesture->first_fingerid))
 				g_pGesture->num_pressed--;
-			device->public.processInputProc(ev, device);
+			if (g_pGesture->palm_rejection_mode == 1 && g_pGesture->stylusInfo.pen_detected == TRUE)
+			{
+				device->public.processInputProc(ev, device);
+			}
+			else if (!(g_pGesture->palm_rejection_mode == 1 && g_pGesture->palm_detected == TRUE))
+			{
+				device->public.processInputProc(ev, device);
+			}
 			GestureHoldDetector(ET_ButtonRelease, ev, device);
 			break;
 
@@ -5026,7 +5436,10 @@ GestureHandleButtonReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr 
 			if(!(g_pGesture->filter_mask == GESTURE_FILTER_MASK_ALL))
 				GestureRecognize(ET_ButtonRelease, ev, device);
 			if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
-				GesturePalmRecognize(ET_ButtonRelease, ev, device);
+			{
+				if (PalmRecognize)
+					_GESTUREPALMRECOGNIZE_(PalmRecognize, ET_ButtonRelease, ev, device);
+			}
 			break;
 
 		default:
@@ -5040,6 +5453,7 @@ GestureHandleKeyPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr devic
 #ifdef __DEBUG_EVENT_HANDLER__
 	XDBG_DEBUG(MGEST, "devid=%d time:%d cur:%d\n", device->id, ev->any.time, GetTimeInMillis());
 #endif//__DEBUG_EVENT_HANDLER__
+	static int find_dev_false_count = 0;
 
 	if(DPMSPowerLevel == DPMSModeOff)
 	{
@@ -5065,14 +5479,44 @@ GestureHandleKeyPressEvent(int screen_num, InternalEvent *ev, DeviceIntPtr devic
 	}
 
 handle_keypress:
+	if (g_pGesture->touchkey_id <= 0 && find_dev_false_count < 10)
+	{
+		DeviceIntPtr dev;
+		find_dev_false_count++;
+
+		for( dev = inputInfo.keyboard ; dev; dev = dev->next )
+		{
+			if(strcasestr(dev->name, "touchkey"))
+			{
+				g_pGesture->touchkey_id = dev->id;
+				find_dev_false_count = 0;
+				break;
+			}
+		}
+	}
 
 	if((g_pGesture->mtsync_status != MTOUCH_FRAME_SYNC_END) && (device->id == g_pGesture->touchkey_id))
 	{
-		XDBG_SECURE(MGEST, "Ignore TouchKey KeyPress (devid:%d, keycode:%d)\n", device->id, ev->device_event.detail.key);
+		if(ev->device_event.detail.key == 177)
+			XDBG_INFO(MGEST, "Ignore TouchKey KEY_MENU (devid:%d)\n", device->id);
+		else if (ev->device_event.detail.key == 166)
+			XDBG_INFO(MGEST, "Ignore TouchKey KEY_BACK (devid:%d)\n", device->id);
+		else
+			XDBG_SECURE(MGEST, "Ignore TouchKey KeyPress (devid:%d, keycode:%d)\n", device->id, ev->device_event.detail.key);
 		return;
 	}
 
 	device->public.processInputProc(ev, device);
+}
+
+void
+GestureHandleKeyReleaseEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
+{
+	if (g_pGesture->pass_keycodes[3] == ev->device_event.detail.key)
+	{
+		XDBG_SECURE(MGEST, "TIME = %d, keycode = %d\n", ev->any.time, ev->device_event.detail.key);
+	}
+    device->public.processInputProc(ev, device);
 }
 
 static ErrorStatus
@@ -5105,14 +5549,6 @@ GestureEnableEventHandler(InputInfoPtr pInfo)
 		goto failed;
 	}
 
-	pGesture->device_setting_timer = TimerSet(pGesture->device_setting_timer, 0, 5000, GestureTimerHandler, pInfo);
-
-	if( !pGesture->device_setting_timer )
-	{
-		XDBG_ERROR(MGEST, "Failed to allocate memory for timer !\n");
-		goto failed;
-	}
-
 	return ERROR_NONE;
 
 failed:
@@ -5128,6 +5564,7 @@ GestureDisableEventHandler(void)
 	ErrorStatus err = ERROR_NONE;
 
 	mieqSetHandler(ET_KeyPress, NULL);
+	mieqSetHandler(ET_KeyRelease, NULL);
 	mieqSetHandler(ET_ButtonPress, NULL);
 	mieqSetHandler(ET_ButtonRelease, NULL);
 	mieqSetHandler(ET_Motion, NULL);
@@ -5146,14 +5583,24 @@ GestureDisableEventHandler(void)
 	return err;
 }
 
-static CARD32
-GestureTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
+static void
+GestureRegisterDeviceInfo(DeviceIntPtr device)
 {
-	InputInfoPtr pInfo = (InputInfoPtr)arg;
+	InputInfoPtr  pInfo = device->public.devicePrivate;
 	GestureDevicePtr pGesture = pInfo->private;
-
-	int idx = 0;
 	DeviceIntPtr dev;
+	ScreenPtr pScreen = miPointerCurrentScreen();
+	int width = 0, height = 0;
+	int idx = 0;
+	int i;
+
+	XDBG_INFO(MGEST, "Get devices information\n");
+
+	for (i=0; i<MAX_MT_DEVICES; i++)
+	{
+		pGesture->mt_devices[i] = NULL;
+	}
+
 	for( dev = inputInfo.pointer ; dev; dev = dev->next )
 	{
 		if(IsMaster(dev) && IsPointerDevice(dev))
@@ -5178,45 +5625,38 @@ GestureTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
 					MAX_MT_DEVICES);
 				continue;
 			}
-			pGesture->mt_devices[idx] = dev;
-			XDBG_INFO(MGEST, "[id:%d] MT device[%d] name=%s\n", dev->id, idx, pGesture->mt_devices[idx]->name);
-			GesturePalmGetAbsAxisInfo(dev);
-			idx++;
-		}
-	}
-
-	for( dev = inputInfo.keyboard ; dev; dev = dev->next )
-	{
-		if(strcasestr(dev->name, "touchkey"))
-		{
-			g_pGesture->touchkey_id = dev->id;
-			break;
+			if (strcasestr(dev->name, "Touchscreen"))
+			{
+				pGesture->mt_devices[idx] = dev;
+				XDBG_INFO(MGEST, "[id:%d] MT device[%d] name=%s\n", dev->id, idx, pGesture->mt_devices[idx]->name);
+				ErrorF("[id:%d] MT device[%d] name=%s\n", dev->id, idx, pGesture->mt_devices[idx]->name);
+				GesturePalmGetAbsAxisInfo(dev);
+				idx++;
+			}
 		}
 	}
 
 	if( !pGesture->master_pointer || !pGesture->xtest_pointer )
 	{
 		XDBG_ERROR(MGEST, "Failed to get info of master pointer or XTest pointer !\n");
-		pGesture->device_setting_timer = TimerSet(pGesture->device_setting_timer, 0, 0, NULL, NULL);
 		pGesture->num_mt_devices = 0;
 
-		return 0;
+		return;
 	}
 
-	pGesture->device_setting_timer = TimerSet(pGesture->device_setting_timer, 0, 0, NULL, NULL);
 	pGesture->num_mt_devices = idx;
 
 	if( !pGesture->num_mt_devices )
 	{
 		XDBG_ERROR(MGEST, "Failed to mt device information !\n");
-		pGesture->device_setting_timer = TimerSet(pGesture->device_setting_timer, 0, 0, NULL, NULL);
 		pGesture->num_mt_devices = 0;
     	pGesture->first_fingerid = -1;
-		return 0;
+		return;
 	}
 
 	pGesture->first_fingerid = pGesture->mt_devices[0]->id;
 	memset(pGesture->fingers, 0, sizeof(TouchStatus)*pGesture->num_mt_devices);
+
 	pGesture->pRootWin = RootWindow(pGesture->master_pointer);
 
 	if(g_pGesture->palm_misc.enabled)
@@ -5231,20 +5671,30 @@ GestureTimerHandler(OsTimerPtr timer, CARD32 time, pointer arg)
 		goto failed;
 	}
 
+	if (pScreen)
+	{
+		pGesture->screen_width = pScreen->width;
+		pGesture->screen_height = pScreen->height;
+		XDBG_ERROR(MGEST, "screen_width = %d, screen_height = %d\n", pGesture->screen_width, pGesture->screen_height);
+	}
+	else
+	{
+		XDBG_ERROR(MGEST, "Fail to get current screen size\n");
+	}
+
 	mieqSetHandler(ET_KeyPress, GestureHandleKeyPressEvent);
+	mieqSetHandler(ET_KeyRelease, GestureHandleKeyReleaseEvent);
 	mieqSetHandler(ET_ButtonPress, GestureHandleButtonPressEvent);
 	mieqSetHandler(ET_ButtonRelease, GestureHandleButtonReleaseEvent);
 	mieqSetHandler(ET_Motion, GestureHandleMotionEvent);
 	mieqSetHandler(ET_MTSync, GestureHandleMTSyncEvent);
 
-	return 0;
+	return;
 
 failed:
 
 	GestureUninstallResourceStateHooks();
 	GestureUnsetMaxNumberOfFingers();
-
-	return 0;
 }
 
 BOOL
@@ -5428,10 +5878,6 @@ GestureEnqueueEvent(int screen_num, InternalEvent *ev, DeviceIntPtr device)
 		}
 		if(!(g_pGesture->palm_filter_mask == GESTURE_PALM_FILTER_MASK_ALL))
 		{
-			if(!(g_pGesture->palm_filter_mask & PalmHoldFilterMask))
-			{
-				GesturePalmRecognize_Hold(ev->any.type, 0, 0);
-			}
 			if(!(g_pGesture->palm_filter_mask & PalmFlickHorizFilterMask))
 			{
 				GesturePalmRecognize_FlickHorizen(ev->any.type, 0);
@@ -5510,6 +5956,7 @@ GestureEventsFlush(void)
 		if(g_pGesture->EQ[i].event->any.type != ET_Motion)
 			XDBG_DEBUG(MGEST, "[%d] type: %d\n", device->id, g_pGesture->EQ[i].event->any.type);
 #endif//__DETAIL_DEBUG__
+
 		for(j = 0 ; j < MAX_MT_DEVICES+1 ; j++)
 		{
 			if(g_pGesture->palm.qti[j].devid == device->id)
@@ -5575,6 +6022,11 @@ GestureInitProperty(DeviceIntPtr dev)
 {
 	int rc;
 
+#ifdef SUPPORT_ANR_WITH_INPUT_EVENT
+	prop_anr_in_input_event = MakeAtom(CHECK_APPLICATION_NOT_RESPONSE_IN_INPUT_EVENT, strlen(CHECK_APPLICATION_NOT_RESPONSE_IN_INPUT_EVENT),  TRUE);
+	prop_anr_event_window = MakeAtom(ANR_EVENT_WINDOW, strlen(ANR_EVENT_WINDOW), TRUE);
+#endif
+
 	prop_gesture_recognizer_onoff = MakeAtom(GESTURE_RECOGNIZER_ONOFF, strlen(GESTURE_RECOGNIZER_ONOFF),  TRUE);
 	rc = XIChangeDeviceProperty(dev, prop_gesture_recognizer_onoff, XA_INTEGER, 32, PropModeReplace, 1, &g_pGesture->is_active, FALSE);
 
@@ -5582,6 +6034,14 @@ GestureInitProperty(DeviceIntPtr dev)
 		return;
 
 	XISetDevicePropertyDeletable(dev, prop_gesture_recognizer_onoff, FALSE);
+
+	prop_gesture_palm_rejection_mode = MakeAtom(GESTURE_PALM_REJECTION_MODE, strlen(GESTURE_PALM_REJECTION_MODE), TRUE);
+	rc = XIChangeDeviceProperty(dev, prop_gesture_palm_rejection_mode, XA_INTEGER, 8, PropModeReplace, 1, &g_pGesture->palm_rejection_mode, FALSE);
+
+	if (rc != Success)
+		return;
+
+	XISetDevicePropertyDeletable(dev, prop_gesture_palm_rejection_mode, FALSE);
 }
 
 static int
@@ -5600,6 +6060,60 @@ GestureSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
 			GestureEnable(data, TRUE, dev);
 		}
 	}
+	else if( prop_gesture_palm_rejection_mode == atom)
+	{
+		int data;
+		if( val->format != 8 || val->type != XA_INTEGER || val->size != 1 )
+			return BadMatch;
+
+		if( !checkonly )
+		{
+			int ret;
+			data = *((BOOL*)val->data);
+			int fd, fd_result;
+			char buf[128];
+
+			g_pGesture->palm_rejection_mode = (int)data;
+
+			fd = open("/sys/class/sec/tsp/cmd", O_WRONLY);
+			if (fd < 0)
+			{
+				XDBG_ERROR(MGEST, "failed to open tsp node(%d)\n", fd);
+				return Success;
+			}
+
+			sprintf(buf, "stylus_enable,%d", !!(g_pGesture->palm_rejection_mode));
+			XDBG_DEBUG(MGEST, "stylus_changed: %d!\n", !!(g_pGesture->palm_rejection_mode));
+
+			ret = write(fd, buf, strlen(buf));
+			if (ret <= 0)
+			{
+				XDBG_WARNING(MGEST, "failed to stylus_changed: %d\n", !!(g_pGesture->palm_rejection_mode));
+			}
+
+			close(fd);
+
+			fd_result = open("/sys/class/sec/tsp/cmd_result", O_RDONLY);
+			if (fd_result < 0)
+			{
+				XDBG_ERROR(MGEST, "failed to open tsp node(%d)\n", fd_result);
+				return Success;
+			}
+
+			memset(buf, 0L, sizeof(buf));
+
+			ret = read(fd_result, buf, sizeof(buf));
+			if (ret <= 0)
+			{
+				XDBG_WARNING(MGEST, "failed to read cmd_result\n");
+			}
+			else
+			{
+				ErrorF("stylus mode result: %s\n", buf);
+			}
+			close(fd_result);
+		}
+	}
 
 	return Success;
 }
@@ -5608,9 +6122,6 @@ GestureSetProperty(DeviceIntPtr dev, Atom atom, XIPropertyValuePtr val,
 static int
 GestureInit(DeviceIntPtr device)
 {
-	InputInfoPtr pInfo;
-	pInfo = device->public.devicePrivate;
-
 #ifdef HAVE_PROPERTIES
 	GestureInitProperty(device);
 	XIRegisterPropertyHandler(device, GestureSetProperty, NULL, NULL);
@@ -5663,6 +6174,19 @@ GesturePreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
     /* process driver specific options */
     pGesture->device = xf86SetStrOption(pInfo->options, "Device", "/dev/null");
     pGesture->is_active = xf86SetIntOption(pInfo->options, "Activate", 0);
+	pGesture->stylus_able = xf86SetIntOption(pInfo->options, "Stylus", 0);
+	pGesture->support_palm = xf86SetIntOption(pInfo->options, "SupportPalm", 0);
+
+	if (pGesture->support_palm)
+	{
+		PalmRecognize = GesturePalmRecognize;
+		XDBG_DEBUG(MGEST, "Palm Support !!\n");
+	}
+	else
+	{
+		PalmRecognize = NULL;
+		XDBG_DEBUG(MGEST, "No Palm Support !!\n");
+	}
 
     {
     	int i;
@@ -5679,6 +6203,7 @@ GesturePreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
     }
 
     pGesture->gestureWin = None;
+
 #ifdef _F_SUPPORT_BEZEL_FLICK_
     pBezel = &pGesture->bezel;
     pBezel->is_active = xf86SetIntOption(pInfo->options, "Bezel_Activate", 0);
@@ -5708,6 +6233,12 @@ GesturePreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
 	pGesture->singlefinger_threshold = xf86SetIntOption(pInfo->options, "SingleFingerThresHold", SGL_FINGER_TIME_THRESHOLD);
 	pGesture->singletap_threshold = xf86SetIntOption(pInfo->options, "SingleTapThresHold", SGL_TAP_TIME_THRESHOLD);
 	pGesture->doubletap_threshold = xf86SetIntOption(pInfo->options, "DoubleTapThresHold", DBL_TAP_TIME_THRESHOLD);
+
+	pGesture->palm_min_touch_major = xf86SetIntOption(pInfo->options, "PalmMinTouchMajor", PALM_MIN_TOUCH_MAJOR);
+	pGesture->palm_min_width_major = xf86SetIntOption(pInfo->options, "PalmMinWidthMajor", PALM_MIN_WIDTH_MAJOR);
+	pGesture->palm_min_touch_major_bezel = xf86SetIntOption(pInfo->options, "PalmMinTouchMajorBezel", PALM_MIN_TOUCH_MAJOR_BEZEL);
+	pGesture->palm_min_width_major_bezel = xf86SetIntOption(pInfo->options, "PalmMinWidthMajorBezel", PALM_MIN_WIDTH_MAJOR_BEZEL);
+	pGesture->palm_bezel = xf86SetIntOption(pInfo->options, "PalmBezel", PALM_BEZEL);
 
 	if (pGesture->is_active)
 		pGesture->ehtype = KEEP_EVENTS;
@@ -5749,6 +6280,13 @@ GesturePreInit(InputDriverPtr drv, InputInfoPtr pInfo, int flags)
 	g_pGesture->enqueue_fulled = 0;
 	g_pGesture->zoom_enabled = 0;
 	memset(g_pGesture->palm.qti, 0, sizeof(g_pGesture->palm.qti[MAX_MT_DEVICES+1]));
+
+	g_pGesture->palm_rejection_mode = 0;
+	g_pGesture->palm_detected = FALSE;
+
+	memset(g_pGesture->stylusInfo.t_status, 0, sizeof(g_pGesture->stylusInfo.t_status[MAX_MT_DEVICES]));
+	g_pGesture->stylusInfo.stylus_id = 0;
+	g_pGesture->stylusInfo.pen_detected = FALSE;
 
     return Success;
 
@@ -5811,6 +6349,9 @@ device_off:
 
       case DEVICE_CLOSE:
             /* free what we have to free */
+            break;
+      case DEVICE_READY:
+            GestureRegisterDeviceInfo(device);
             break;
     }
     return Success;
