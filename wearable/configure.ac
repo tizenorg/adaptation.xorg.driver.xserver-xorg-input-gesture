@@ -1,25 +1,23 @@
-#  Copyright 2007 Peter Hutterer
-#  Copyright 2009 Przemysław Firszt
+#  Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved 
 #
-#  Permission is hereby granted, free of charge, to any person obtaining a
-#  copy of this software and associated documentation files (the "Software"),
-#  to deal in the Software without restriction, including without limitation
-#  on the rights to use, copy, modify, merge, publish, distribute, sub
-#  license, and/or sell copies of the Software, and to permit persons to whom
-#  the Software is furnished to do so, subject to the following conditions:
+#  Permission to use, copy, modify, distribute, and sell this software and its
+#  documentation for any purpose is hereby granted without fee, provided that
+#  the above copyright notice appear in all copies and that both that
+#  copyright notice and this permission notice appear in supporting
+#  documentation, and that the name of Red Hat not be used in
+#  advertising or publicity pertaining to distribution of the software without
+#  specific, written prior permission.  Red Hat makes no
+#  representations about the suitability of this software for any purpose.  It
+#  is provided "as is" without express or implied warranty.
 #
-#  The above copyright notice and this permission notice (including the next
-#  paragraph) shall be included in all copies or substantial portions of the
-#  Software.
+#  RED HAT DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
+#  INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
+#  EVENT SHALL RED HAT BE LIABLE FOR ANY SPECIAL, INDIRECT OR
+#  CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
+#  DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+#  TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+#  PERFORMANCE OF THIS SOFTWARE.
 #
-#  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-#  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-#  FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.  IN NO EVENT SHALL
-#  AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-#  IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-#  CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-#
-# Process this file with autoconf to produce a configure script
 
 AC_PREREQ(2.57)
 AC_INIT([xserver-xorg-input-gesture],
@@ -56,7 +54,7 @@ AC_SUBST(inputdir)
 
 # Checks for pkg-config packages. We need to be able to override sdkdir
 # to satisfy silly distcheck requirements.
-PKG_CHECK_MODULES(XORG, xorg-server xproto $REQUIRED_MODULES)
+PKG_CHECK_MODULES(XORG, xorg-server xproto dlog $REQUIRED_MODULES)
 XORG_CFLAGS="$CWARNFLAGS $XORG_CFLAGS"
 AC_ARG_WITH([sdkdir], [],
     [sdkdir="$withval"],
