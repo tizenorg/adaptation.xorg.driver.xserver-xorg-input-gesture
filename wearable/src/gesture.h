@@ -37,6 +37,16 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <X11/extensions/gestureconst.h>
 #include <pixman.h>
 
+#ifdef ENABLE_TTRACE
+#include <ttrace.h>
+
+#define TTRACE_BEGIN(NAME) traceBegin(TTRACE_TAG_INPUT, NAME)
+#define TTRACE_END() traceEnd(TTRACE_TAG_INPUT)
+#else //ENABLE_TTRACE
+#define TTRACE_BEGIN(NAME)
+#define TTRACE_END()
+#endif //ENABLE_TTRACE
+
 #if GET_ABI_MAJOR(ABI_XINPUT_VERSION) >= 3
 #define HAVE_PROPERTIES 1
 #endif
@@ -116,6 +126,10 @@ enum
 	FLICK_POINT_MAX
 };
 
+/* Gesture query devices infomation and register handlers
+  * if a device_control function is called using DEVICE_READY */
+#define DEVICE_READY 11
+
 #define TAP_AREA_THRESHOLD			10000//= 100pixel * 100pixel
 #define TAP_MOVE_THRESHOLD			35//pixel
 #define SGL_TAP_TIME_THRESHOLD		300//ms
@@ -137,6 +151,16 @@ enum
 #define AXIS_LABEL_PROP_ABS_MT_TOUCH_MAJOR "Abs MT Touch Major"
 #define AXIS_LABEL_PROP_ABS_MT_TOUCH_MINOR "Abs MT Touch Minor"
 #define AXIS_LABEL_PROP_ABS_MT_PALM        "Abs MT Palm/MT Sumsize"
+
+#ifndef _SUPPORT_EVDEVMULTITOUCH_DRV_
+#define GESTURE_TOUCH_PRESS ET_TouchBegin
+#define GESTURE_TOUCH_MOTION ET_TouchUpdate
+#define GESTURE_TOUCH_RELEASE ET_TouchEnd
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+#define GESTURE_TOUCH_PRESS ET_ButtonPress
+#define GESTURE_TOUCH_MOTION ET_Motion
+#define GESTURE_TOUCH_RELEASE ET_ButtonRelease
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 
 typedef enum _MTSyncType
 {
@@ -167,13 +191,19 @@ enum EventType
 {
     ET_KeyPress = 2,
     ET_KeyRelease,
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
     ET_ButtonPress,
     ET_ButtonRelease,
     ET_Motion,
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+    ET_TouchBegin = 7,
+    ET_TouchUpdate,
+    ET_TouchEnd,
+    ET_TouchOwnership,
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
     /*
     ...
     */
-    ET_TouchCancel = 31,
     ET_MTSync = 0x7E,
     ET_Internal = 0xFF /* First byte */
 };
@@ -217,6 +247,7 @@ struct _DeviceEvent {
     int corestate;    /**< Core key/button state BEFORE the event */
     int key_repeat;   /**< Internally-generated key repeat event */
     uint32_t flags;   /**< Flags to be copied into the generated event */
+    uint32_t resource; /**< Touch event resource, only for TOUCH_REPLAYING */
 };
 
 typedef struct _AnyEvent AnyEvent;
@@ -232,20 +263,6 @@ struct _AnyEvent
     int y;
 };
 
-typedef struct _TouchCancelEvent TouchCancelEvent;
-struct _TouchCancelEvent {
-    unsigned char header; /**< Always ET_Internal */
-    enum EventType type;  /**< ET_TouchOwnership */
-    int length;           /**< Length in bytes */
-    Time time;            /**< Time in ms */
-    int deviceid;         /**< Device to post this event for */
-    int sourceid;         /**< The physical source device */
-    uint32_t resource;    /**< Provoking grab or event selection */
-    uint32_t flags;       /**< Flags to be copied into the generated event */
-};
-
-
-
 union _InternalEvent {
 	struct {
 	    unsigned char header; /**< Always ET_Internal */
@@ -255,7 +272,6 @@ union _InternalEvent {
 	} any;
 	AnyEvent any_event;
 	DeviceEvent device_event;
-	TouchCancelEvent touch_cancel_event;
 };
 
 #define wUseDefault(w,field,def)	((w)->optional ? (w)->optional->field : def)
@@ -271,21 +287,21 @@ typedef struct _DevCursorNode {
 } DevCursNodeRec, *DevCursNodePtr, *DevCursorList;
 
 typedef struct _WindowOpt {
-    VisualID		visual;		   /* default: same as parent */
-    CursorPtr		cursor;		   /* default: window.cursorNone */
-    Colormap		colormap;	   /* default: same as parent */
-    Mask		dontPropagateMask; /* default: window.dontPropagate */
-    Mask		otherEventMasks;   /* default: 0 */
-    struct _OtherClients *otherClients;	   /* default: NULL */
-    struct _GrabRec	*passiveGrabs;	   /* default: NULL */
-    PropertyPtr		userProps;	   /* default: NULL */
-    unsigned long	backingBitPlanes;  /* default: ~0L */
-    unsigned long	backingPixel;	   /* default: 0 */
-    RegionPtr		boundingShape;	   /* default: NULL */
-    RegionPtr		clipShape;	   /* default: NULL */
-    RegionPtr		inputShape;	   /* default: NULL */
-    struct _OtherInputMasks *inputMasks;   /* default: NULL */
-    DevCursorList       deviceCursors;     /* default: NULL */
+    CursorPtr cursor;           /* default: window.cursorNone */
+    VisualID visual;            /* default: same as parent */
+    Colormap colormap;          /* default: same as parent */
+    Mask dontPropagateMask;     /* default: window.dontPropagate */
+    Mask otherEventMasks;       /* default: 0 */
+    struct _OtherClients *otherClients; /* default: NULL */
+    struct _GrabRec *passiveGrabs;      /* default: NULL */
+    PropertyPtr userProps;      /* default: NULL */
+    CARD32 backingBitPlanes;    /* default: ~0L */
+    CARD32 backingPixel;        /* default: 0 */
+    RegionPtr boundingShape;    /* default: NULL */
+    RegionPtr clipShape;        /* default: NULL */
+    RegionPtr inputShape;       /* default: NULL */
+    struct _OtherInputMasks *inputMasks;        /* default: NULL */
+    DevCursorList deviceCursors;        /* default: NULL */
 } WindowOptRec, *WindowOptPtr;
 
 typedef struct _Window {
@@ -328,6 +344,12 @@ typedef struct _Window {
     unsigned		forcedBG:1;	/* must have an opaque background */
 #ifdef ROOTLESS
     unsigned		rootlessUnhittable:1;	/* doesn't hit-test */
+#endif
+
+#define COMPOSITE
+#ifdef COMPOSITE
+    unsigned damagedDescendants:1;      /* some descendants are damaged */
+    unsigned inhibitBGPaint:1;  /* paint the background? */
 #endif
 } WindowRec;
 
@@ -375,6 +397,9 @@ enum
 typedef struct _tagTouchStatus
 {
 	int status;//One of BTN_RELEASED, BTN_PRESSED and BTN_MOVING
+#ifndef _SUPPORT_EVDEVMULTITOUCH_DRV_
+	int touchid;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 	uint32_t flags;
 
 	int px;		//press x
@@ -405,6 +430,34 @@ typedef struct _tagPalmDrvStatus
 	int verti_coord[PALM_VERTI_ARRAY_COUNT];
 } PalmMiscInfo, *PalmMiscInfoPtr;
 
+#ifndef _SUPPORT_EVDEVMULTITOUCH_DRV_
+typedef struct _tagPalmInfo
+{
+	int *pressed_idx;
+}PalmInfo, *PalmInfoPtr;
+
+typedef struct _tagPalmFlickInfo
+{
+	int *base_x;
+	int *base_y;
+	int *update_x;
+	int *update_y;
+
+	int *current_x;
+	int *current_y;
+	Bool *press_status;
+	Bool *release_status;
+
+	int *line_idx;
+	int *prev_line_idx;
+	int *press_idx;
+	Bool *is_line_invalid;
+
+	int *max_tmajor;
+	Bool *is_tmajor_invalid;
+	int *mt_sync_count;
+} PalmFlickInfo, *PalmFlickInfoPtr;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 
 typedef struct _GestureDeviceRec
 {
@@ -445,7 +498,11 @@ typedef struct _GestureDeviceRec
 	int palm_flick_min_tmajor_threshold;
 	char *factory_cmdname;
 
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
 	int max_mt_tmajor[MAX_MT_DEVICES];
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV
+	int *max_mt_tmajor;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV
 
 	int hwkey_id;
 	char *hwkey_name;
@@ -475,9 +532,11 @@ typedef struct _GestureDeviceRec
 	int hold_detector_activate;
 	int has_hold_grabmask;
 	pixman_region16_t chold_area;
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
 	CurTouchStatus cts[MAX_MT_DEVICES];
-	CurTouchStatus last_touches[MAX_MT_DEVICES];
-	Bool touch_cancel_status;
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+	CurTouchStatus *cts;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 	Bool hold_detected;
 
 	PalmMiscInfo palm_misc;
@@ -488,21 +547,39 @@ typedef struct _GestureDeviceRec
 	int mt_py_idx;
 
 	pixman_region16_t area;
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
 	pixman_region16_t finger_rects[MAX_MT_DEVICES];
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+	pixman_region16_t *finger_rects;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 
 	WindowPtr pTempWin;
 	int inc_num_pressed;
 
 	int first_fingerid;
 	int num_pressed;
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
 	TouchStatus fingers[MAX_MT_DEVICES];
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+	TouchStatus *fingers;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
 	int event_sum[MAX_MT_DEVICES];
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+	int *event_sum;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 	uint32_t recognized_gesture;
 	uint32_t filter_mask;
 
 	DeviceIntPtr this_device;
+#ifdef _SUPPORT_EVDEVMULTITOUCH_DRV_
 	DeviceIntPtr mt_devices[MAX_MT_DEVICES];
+#else //_SUPPORT_EVDEVMULTITOUCH_DRV_
+	DeviceIntPtr mt_devices;
+	PalmFlickInfo palmFlickInfo;
+	PalmInfo palmInfo;
+#endif //_SUPPORT_EVDEVMULTITOUCH_DRV_
 	DeviceIntPtr master_pointer;
 	DeviceIntPtr xtest_pointer;
 

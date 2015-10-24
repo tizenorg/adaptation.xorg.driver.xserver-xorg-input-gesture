@@ -61,6 +61,10 @@ AC_ARG_WITH([sdkdir], [],
     [sdkdir=`$PKG_CONFIG --variable=sdkdir xorg-server`])
 AC_SUBST([sdkdir])
 
+# ttrace support
+PKG_CHECK_MODULES(TTRACE, [ttrace],
+		AC_DEFINE(ENABLE_TTRACE, 1, [ttrace available]));
+
 # Checks for libraries.
 
 # Checks for header files.

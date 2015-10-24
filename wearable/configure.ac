@@ -1,4 +1,4 @@
-#  Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved 
+#  Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved
 #
 #  Permission to use, copy, modify, distribute, and sell this software and its
 #  documentation for any purpose is hereby granted without fee, provided that
@@ -60,6 +60,10 @@ AC_ARG_WITH([sdkdir], [],
     [sdkdir="$withval"],
     [sdkdir=`$PKG_CONFIG --variable=sdkdir xorg-server`])
 AC_SUBST([sdkdir])
+
+# ttrace support
+PKG_CHECK_MODULES(TTRACE, [ttrace],
+		AC_DEFINE(ENABLE_TTRACE, 1, [ttrace available]));
 
 # Checks for libraries.
 

@@ -1,4 +1,4 @@
-#  Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved 
+#  Copyright (c) 2011 Samsung Electronics Co., Ltd All Rights Reserved
 #
 #  Permission to use, copy, modify, distribute, and sell this software and its
 #  documentation for any purpose is hereby granted without fee, provided that
@@ -24,14 +24,14 @@
 # -avoid-version prevents gratuitous .0.0.0 version numbers on the end
 # _ladir passes a dummy rpath to libtool so the thing will actually link
 # TODO: -nostdlib/-Bstatic/-lgcc platform magic, not installing the .a, etc.
-AM_CFLAGS = $(XORG_CFLAGS)
+AM_CFLAGS = $(XORG_CFLAGS) $(TTRACE_CFLAGS)
 
 @DRIVER_NAME@_drv_la_LTLIBRARIES = @DRIVER_NAME@_drv.la
-@DRIVER_NAME@_drv_la_LDFLAGS = -module -avoid-version
+@DRIVER_NAME@_drv_la_LDFLAGS = -module -avoid-version $(TTRACE_LIBS)
 @DRIVER_NAME@_drv_ladir = @inputdir@
 
 INCLUDES=-I$(top_srcdir)/include/
 
 @DRIVER_NAME@_drv_la_SOURCES = @DRIVER_NAME@.c \
-                               @DRIVER_NAME@.h 
+                               @DRIVER_NAME@.h
 
